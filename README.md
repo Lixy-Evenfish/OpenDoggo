@@ -32,8 +32,8 @@ JDK 17+、Maven。
 项目根目录建 `.env`：
 
 ```
-ANTHROPIC_BASE_URL=https://opencode.ai/zen
-MODEL_ID=claude-sonnet-4-6
+ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic
+MODEL_ID=glm-5.3
 ```
 
 API key 走环境变量，**不要写进 `.env`**：

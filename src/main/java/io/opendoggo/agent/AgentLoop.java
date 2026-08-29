@@ -1,16 +1,13 @@
 package io.opendoggo.agent;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import io.opendoggo.model.ContentBlock;
 import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.ModelResponse;
 import io.opendoggo.model.ToolResult;
 import io.opendoggo.tool.ToolDispatch;
-import io.opendoggo.tool.impl.ShellTool;
 
 import java.io.IOException;
-import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -29,17 +26,17 @@ public final class AgentLoop {
 
     public AgentLoop(
             ModelClient modelClient,
-            Path workingDirectory
+            ToolDispatch toolDispatch
+            
     ) {
         this.modelClient = Objects.requireNonNull(
                 modelClient,
                 "modelClient cannot be null"
         );
 
-        this.toolDispatch = new ToolDispatch();
-        toolDispatch.register(
-                "bash",
-                new ShellTool(workingDirectory)
+        this.toolDispatch = Objects.requireNonNull(
+                toolDispatch,
+                "toolDispatch cannot be null"
         );
 
     }
@@ -105,19 +102,4 @@ public final class AgentLoop {
         );
     }
 
-   
-
-    private String abbreviate(
-            String value,
-            int maximumLength
-    ) {
-        if (value.length() <= maximumLength) {
-            return value;
-        }
-
-        return value.substring(
-                0,
-                maximumLength
-        ) + "...";
-    }
 }

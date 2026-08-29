@@ -41,20 +41,19 @@ public final class AnthropicClient implements ModelClient {
     /**
      * 工具定义：与 s1 的 TOOLS 保持一致，只有 bash。
      */
-    private static final ArrayNode TOOL_DEFINITIONS =
-            createToolDefinitions();
-
     private final URI endpoint;
     private final String apiKey;
     private final String modelId;
     private final String systemPrompt;
     private final HttpClient httpClient;
+    private JsonNode toolDefinitions;
 
     public AnthropicClient(
             String baseUrl,
             String apiKey,
             String modelId,
-            String systemPrompt
+            String systemPrompt,
+            JsonNode toolDefinitions
     ) {
         Objects.requireNonNull(baseUrl, "baseUrl cannot be null");
         Objects.requireNonNull(apiKey, "apiKey cannot be null");
@@ -62,6 +61,10 @@ public final class AnthropicClient implements ModelClient {
         Objects.requireNonNull(
                 systemPrompt,
                 "systemPrompt cannot be null"
+        );
+        Objects.requireNonNull(
+                toolDefinitions,
+                "toolDefinitions cannot be null"
         );
 
         this.endpoint = URI.create(
@@ -71,7 +74,7 @@ public final class AnthropicClient implements ModelClient {
         this.apiKey = apiKey;
         this.modelId = modelId;
         this.systemPrompt = systemPrompt;
-
+        this.toolDefinitions = toolDefinitions;
         this.httpClient = HttpClient.newBuilder()
                 .connectTimeout(Duration.ofSeconds(30))
                 .build();
@@ -130,7 +133,7 @@ public final class AnthropicClient implements ModelClient {
         body.put("model", modelId);
         body.put("max_tokens", MAX_TOKENS);
         body.put("system", systemPrompt);
-        body.set("tools", TOOL_DEFINITIONS);
+        body.set("tools", toolDefinitions);
 
         ArrayNode messageArray = body.putArray("messages");
 
@@ -195,25 +198,6 @@ public final class AnthropicClient implements ModelClient {
 
         // JsonNode 列表到此结束，往上只认 ContentBlock。
         return new ModelResponse(blocks);
-    }
-
-    private static ArrayNode createToolDefinitions() {
-        ArrayNode tools = MAPPER.createArrayNode();
-
-        ObjectNode bash = tools.addObject();
-        bash.put("name", "bash");
-        bash.put("description", "Run a shell command.");
-
-        ObjectNode schema = bash.putObject("input_schema");
-        schema.put("type", "object");
-
-        schema.putObject("properties")
-                .putObject("command")
-                .put("type", "string");
-
-        schema.putArray("required").add("command");
-
-        return tools;
     }
 
     private static String stripTrailingSlash(String value) {

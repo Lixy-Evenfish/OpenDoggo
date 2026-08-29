@@ -5,6 +5,7 @@ import io.opendoggo.environment.Env;
 import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.impl.AnthropicClient;
+import io.opendoggo.tool.ToolDispatch;
 import io.opendoggo.tool.impl.ShellTool;
 
 import java.io.BufferedReader;
@@ -16,6 +17,8 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
+
+import com.fasterxml.jackson.databind.node.ArrayNode;
 
 /**
  * OpenDoggo 入口，对应 s1 的 __main__ 段。
@@ -61,16 +64,20 @@ public final class Main {
                         + ". Use bash to solve tasks. "
                         + "Act, don't explain.";
 
+        ToolDispatch toolDispatch = new ToolDispatch();
+        toolDispatch.register(new ShellTool(workingDirectory));
+        ArrayNode toolDefinitions = toolDispatch.toolDefinitions();
         ModelClient modelClient = new AnthropicClient(
                 baseUrl,
                 apiKey,
                 modelId,
-                systemPrompt
+                systemPrompt,
+                toolDefinitions
         );
 
         AgentLoop agentLoop = new AgentLoop(
                 modelClient,
-                workingDirectory
+                toolDispatch
         );
 
         runRepl(agentLoop, workingDirectory);

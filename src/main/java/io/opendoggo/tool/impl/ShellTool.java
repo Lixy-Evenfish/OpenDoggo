@@ -12,6 +12,8 @@ import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import io.opendoggo.tool.ToolHandler;
 
@@ -48,9 +50,34 @@ public final class ShellTool implements ToolHandler {
         this.timeout = Duration.ofSeconds(120);
     }
 
+    @Override
+    public String name() {
+        return "bash";
+    }
+
+    @Override
+    public String description() {
+        return "Run a shell command.";
+    }
+
+    @Override
+    public JsonNode inputSchema() {
+        ObjectNode schema =
+                JsonNodeFactory.instance.objectNode();
+        schema.put("type", "object");
+
+        schema.putObject("properties")
+                .putObject("command")
+                .put("type", "string");
+
+        schema.putArray("required").add("command");
+        return schema;
+    }
     /**
      * 执行命令并返回标准输出和错误输出。
      */
+
+    @Override
     public String execute(JsonNode input) {
         JsonNode node = input.get("command");
         String command = (node == null) ? null : node.asText();
