@@ -1,4 +1,4 @@
-package io.opendoggo.tool;
+package io.opendoggo.tool.impl;
 
 import java.io.IOException;
 import java.nio.charset.Charset;
@@ -11,10 +11,14 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.TimeUnit;
 
+import com.fasterxml.jackson.databind.JsonNode;
+
+import io.opendoggo.tool.ToolHandler;
+
 /**
  * 在指定工作目录中执行 Shell 命令。
  */
-public final class ShellTool {
+public final class ShellTool implements ToolHandler {
 
     private static final int MAX_OUTPUT_LENGTH = 50000;
 
@@ -47,7 +51,9 @@ public final class ShellTool {
     /**
      * 执行命令并返回标准输出和错误输出。
      */
-    public String execute(String command) {
+    public String execute(JsonNode input) {
+        JsonNode node = input.get("command");
+        String command = (node == null) ? null : node.asText();
         if (command == null || command.isBlank()) {
             return "Error: command cannot be empty";
         }
@@ -56,9 +62,9 @@ public final class ShellTool {
             return "Error: Dangerous command blocked";
         }
 
-        Process process = null;
-
+        Process process = null;   
         try {
+            
             process = new ProcessBuilder(
                     createShellCommand(command)
             )

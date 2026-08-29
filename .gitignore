@@ -1,5 +1,6 @@
 # 构建产物
 target/
+dependency-reduced-pom.xml
 
 # 密钥与本地配置
 .env

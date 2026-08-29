@@ -48,7 +48,7 @@ public record ContentBlock(
         );
     }
 
-     public boolean isText() {
+    public boolean isText() {
         return "text".equals(type);
     }
 

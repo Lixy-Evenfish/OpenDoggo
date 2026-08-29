@@ -1,22 +1,20 @@
 package io.opendoggo;
 
 import io.opendoggo.agent.AgentLoop;
-import io.opendoggo.model.AnthropicClient;
+import io.opendoggo.environment.Env;
 import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
-import io.opendoggo.tool.ShellTool;
+import io.opendoggo.model.impl.AnthropicClient;
+import io.opendoggo.tool.impl.ShellTool;
 
 import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Set;
 
 /**
@@ -33,10 +31,11 @@ public final class Main {
     }
 
     public static void main(String[] args) {
-        Map<String, String> environment = loadEnvironment();
+        Env env = Env.load();
 
-        String apiKey = environment.get("ANTHROPIC_API_KEY");
-        String modelId = environment.get("MODEL_ID");
+        String apiKey = env.get("ANTHROPIC_API_KEY");
+        String modelId = env.get("MODEL_ID");
+        String baseUrl = env.get("ANTHROPIC_BASE_URL");
 
         if (isBlank(apiKey) || isBlank(modelId)) {
             System.err.println(
@@ -47,8 +46,6 @@ public final class Main {
 
             System.exit(1);
         }
-
-        String baseUrl = environment.get("ANTHROPIC_BASE_URL");
 
         if (isBlank(baseUrl)) {
             baseUrl = AnthropicClient.DEFAULT_BASE_URL;
@@ -73,7 +70,7 @@ public final class Main {
 
         AgentLoop agentLoop = new AgentLoop(
                 modelClient,
-                new ShellTool(workingDirectory)
+                workingDirectory
         );
 
         runRepl(agentLoop, workingDirectory);
@@ -150,69 +147,6 @@ public final class Main {
 
             System.out.println();
         }
-    }
-
-    /**
-     * 先读进程环境变量，再用 .env 覆盖。
-     *
-     * 与 s1 的 load_dotenv(override=True) 行为一致。
-     */
-    private static Map<String, String> loadEnvironment() {
-        Map<String, String> values =
-                new HashMap<>(System.getenv());
-
-        Path envFile = Path.of(".env");
-
-        if (Files.isRegularFile(envFile)) {
-            try {
-                for (String line : Files.readAllLines(
-                        envFile,
-                        StandardCharsets.UTF_8
-                )) {
-                    parseEnvLine(line, values);
-                }
-            } catch (IOException exception) {
-                System.err.println(
-                        "Warning: unable to read .env: "
-                                + exception.getMessage()
-                );
-            }
-        }
-
-        return values;
-    }
-
-    private static void parseEnvLine(
-            String line,
-            Map<String, String> values
-    ) {
-        String trimmed = line.strip();
-
-        if (trimmed.isEmpty() || trimmed.startsWith("#")) {
-            return;
-        }
-
-        int separator = trimmed.indexOf('=');
-
-        if (separator <= 0) {
-            return;
-        }
-
-        String key = trimmed.substring(0, separator).strip();
-        String value =
-                trimmed.substring(separator + 1).strip();
-
-        // 去掉可选的包裹引号。
-        if (value.length() >= 2
-                && (value.startsWith("\"")
-                        && value.endsWith("\"")
-                || value.startsWith("'")
-                        && value.endsWith("'"))) {
-
-            value = value.substring(1, value.length() - 1);
-        }
-
-        values.put(key, value);
     }
 
     private static void truncate(

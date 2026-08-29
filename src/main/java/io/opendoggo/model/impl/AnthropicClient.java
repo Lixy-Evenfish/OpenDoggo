@@ -1,9 +1,13 @@
-package io.opendoggo.model;
+package io.opendoggo.model.impl;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import io.opendoggo.model.ContentBlock;
+import io.opendoggo.model.Message;
+import io.opendoggo.model.ModelClient;
+import io.opendoggo.model.ModelResponse;
 
 import java.io.IOException;
 import java.net.URI;
@@ -140,13 +144,18 @@ public final class AnthropicClient implements ModelClient {
     }
 
     /**
-     * 只保留 text 与 tool_use 块，其余类型忽略。
+     * HTTP 响应当成 JSON 树解析，只抽出 text / tool_use。
+     *
+     * body: String → root: JsonNode → blocks: ContentBlock 列表
+     * → ModelResponse。
      */
     private ModelResponse parseResponse(String body)
             throws IOException {
 
+        // String → JsonNode。整段 HTTP body 变成可按下标/字段走的树。
         JsonNode root = MAPPER.readTree(body);
 
+        // 业务错误在 JSON 里，不在 HTTP 状态码上。
         JsonNode error = root.get("error");
 
         if (error != null && !error.isNull()) {
@@ -157,27 +166,34 @@ public final class AnthropicClient implements ModelClient {
 
         List<ContentBlock> blocks = new ArrayList<>();
 
+        // content 是数组；缺字段时 path() 给 missing node，for 直接跳过。
+        // 每个元素仍是 JsonNode，按 type 决定要不要变成 ContentBlock。
         for (JsonNode node : root.path("content")) {
             String type = node.path("type").asText("");
 
             if ("text".equals(type)) {
+                // 普通回复文字。asText("")：没有 text 就当空串。
                 blocks.add(ContentBlock.text(
                         node.path("text").asText("")
                 ));
 
             } else if ("tool_use".equals(type)) {
+                // 模型要调工具。id 用来把结果对回去，name/input 是调用参数。
                 JsonNode input = node.get("input");
 
                 blocks.add(ContentBlock.toolUse(
                         node.path("id").asText(),
                         node.path("name").asText(),
+                        // input 缺失时给空对象，避免后面取 command 空指针。
                         input == null || input.isNull()
                                 ? MAPPER.createObjectNode()
                                 : input
                 ));
             }
+            // thinking 等其它 type 直接丢掉。
         }
 
+        // JsonNode 列表到此结束，往上只认 ContentBlock。
         return new ModelResponse(blocks);
     }
 

@@ -6,9 +6,11 @@ import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.ModelResponse;
 import io.opendoggo.model.ToolResult;
-import io.opendoggo.tool.ShellTool;
+import io.opendoggo.tool.ToolDispatch;
+import io.opendoggo.tool.impl.ShellTool;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -23,21 +25,23 @@ public final class AgentLoop {
     private static final int MAX_TOOL_ROUNDS = 50;
 
     private final ModelClient modelClient;
-    private final ShellTool shellTool;
+    private final ToolDispatch toolDispatch;
 
     public AgentLoop(
             ModelClient modelClient,
-            ShellTool shellTool
+            Path workingDirectory
     ) {
         this.modelClient = Objects.requireNonNull(
                 modelClient,
                 "modelClient cannot be null"
         );
 
-        this.shellTool = Objects.requireNonNull(
-                shellTool,
-                "shellTool cannot be null"
+        this.toolDispatch = new ToolDispatch();
+        toolDispatch.register(
+                "bash",
+                new ShellTool(workingDirectory)
         );
+
     }
 
     /**
@@ -81,7 +85,11 @@ public final class AgentLoop {
 
             // 一次模型回复可能包含多个工具调用。
             for (ContentBlock toolCall : toolCalls) {
-                results.add(executeTool(toolCall));
+                String output = toolDispatch.execute(toolCall);
+                System.out.println(output);
+                
+                results.add(new ToolResult(toolCall.id(),output));
+
             }
 
             // 工具结果以 user 消息返回给模型。
@@ -97,59 +105,7 @@ public final class AgentLoop {
         );
     }
 
-    /**
-     * 分发并执行一个工具调用。
-     */
-    private ToolResult executeTool(
-            ContentBlock toolCall
-    ) {
-        String result;
-
-        if (!"bash".equals(toolCall.name())) {
-            result =
-                    "Error: Unknown tool: "
-                            + toolCall.name();
-
-            return new ToolResult(
-                    toolCall.id(),
-                    result
-            );
-        }
-
-        JsonNode input = toolCall.input();
-        JsonNode commandNode =
-                input == null
-                        ? null
-                        : input.get("command");
-
-        if (commandNode == null
-                || !commandNode.isTextual()) {
-            result =
-                    "Error: bash requires "
-                            + "a string command";
-
-            return new ToolResult(
-                    toolCall.id(),
-                    result
-            );
-        }
-
-        String command = commandNode.asText();
-
-        System.out.println("$ " + command);
-
-        result = shellTool.execute(command);
-
-        // 控制终端预览长度，完整结果仍返回模型。
-        System.out.println(
-                abbreviate(result, 200)
-        );
-
-        return new ToolResult(
-                toolCall.id(),
-                result
-        );
-    }
+   
 
     private String abbreviate(
             String value,

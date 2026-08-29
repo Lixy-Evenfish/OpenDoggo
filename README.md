@@ -62,28 +62,12 @@ qwen3.7-max        qwen3.5-plus        ...
 
 ## 构建运行
 
+### 方式一：打包成可执行 JAR
+
 ```bash
-# 只需一次
-mvn compile
-mvn org.apache.maven.plugins:maven-dependency-plugin:3.6.1:build-classpath \
-    -Dmdep.outputFile=cp.txt
-
-# 每次运行
-java -cp "target/classes:$(cat cp.txt)" io.opendoggo.Main
+mvn package
+java -jar target/opendoggo-0.1.0-SNAPSHOT.jar
 ```
-
-改代码后重跑 `mvn compile` 即可，`cp.txt` 不用重新生成。
-
-```
-OpenDoggo s1: Agent Loop
-cwd: /path/to/workdir
-
-doggo >> 统计这个项目有多少行 java 代码
-$ find . -name "*.java" | xargs wc -l
-...
-```
-
-`q` / `exit` / 空回车 / Ctrl+D 退出。
 
 ## 结构
 
