@@ -82,9 +82,13 @@ public final class AgentLoop {
 
             // 一次模型回复可能包含多个工具调用。
             for (ContentBlock toolCall : toolCalls) {
-                String output = toolDispatch.execute(toolCall);
-                System.out.println(output);
-                
+                System.out.println("> " + toolCall.name());
+
+                String output =
+                        toolDispatch.execute(toolCall);
+
+                System.out.println(preview(output));
+
                 results.add(new ToolResult(toolCall.id(),output));
 
             }
@@ -100,6 +104,17 @@ public final class AgentLoop {
                         + MAX_TOOL_ROUNDS
                         + " tool rounds"
         );
+    }
+
+    /**
+     * 控制台只预览前 200 字符，完整输出仍回传给模型。
+     */
+    private static String preview(String output) {
+        if (output.length() <= 200) {
+            return output;
+        }
+
+        return output.substring(0, 200);
     }
 
 }

@@ -6,7 +6,11 @@ import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.impl.AnthropicClient;
 import io.opendoggo.tool.ToolDispatch;
+import io.opendoggo.tool.impl.EditFileTool;
+import io.opendoggo.tool.impl.GlobTool;
+import io.opendoggo.tool.impl.ReadFileTool;
 import io.opendoggo.tool.impl.ShellTool;
+import io.opendoggo.tool.impl.WriteFileTool;
 
 import java.io.BufferedReader;
 import java.io.IOException;
@@ -57,15 +61,20 @@ public final class Main {
         Path workingDirectory =
                 Path.of("").toAbsolutePath().normalize();
 
-        // 与 s1 的 SYSTEM 一致，把工作目录写进提示词。
+        // 与 s2 的 SYSTEM 一致，把工作目录写进提示词。
         String systemPrompt =
                 "You are a coding agent at "
                         + workingDirectory
-                        + ". Use bash to solve tasks. "
+                        + ". Use the available tools "
+                        + "to solve tasks. "
                         + "Act, don't explain.";
 
         ToolDispatch toolDispatch = new ToolDispatch();
         toolDispatch.register(new ShellTool(workingDirectory));
+        toolDispatch.register(new ReadFileTool(workingDirectory));
+        toolDispatch.register(new WriteFileTool(workingDirectory));
+        toolDispatch.register(new EditFileTool(workingDirectory));
+        toolDispatch.register(new GlobTool(workingDirectory));
         ArrayNode toolDefinitions = toolDispatch.toolDefinitions();
         ModelClient modelClient = new AnthropicClient(
                 baseUrl,
