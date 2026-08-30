@@ -1,141 +1,199 @@
-# s03: Permission — 実行前に権限を判断する
+# s04: Hooks — ループに掛ける、ループには書き込まない
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-s01 → s02 → `s03` → [s04](../s04_hooks/) → s05 → ... → s16 → s17
-> *"ツール実行前に権限を判断"* — 権限パイプラインは、どの操作に承認が必要かを決める。
+s01 → s02 → s03 → `s04` → [s05](../s05_todo_write/) → s06 → ... → s16 → s17
+
+> *"ループに掛ける、ループには書き込まない"* — フックがツール実行の前後に拡張ロジックを注入する。
 >
-> **Harness レイヤー**: 権限 — ツール実行前に一つのゲートを追加。
+> **Harness レイヤー**: フック — ループを侵襲しない拡張ポイント。
 
 ---
 
 ## 課題
 
-s02 の Agent は 5 つのツールを持つ。file tools は `safe_path` で保護されるが、bash は制限なし。「プロジェクトを掃除して」と頼むと、`rm -rf /` を実行しかねない。
+s03 の Agent には権限チェックがある。しかし新しいチェックを追加するたび、「bash 呼び出しを毎回ログに記録」「操作後に自動 git add」、`agent_loop` 関数を修正する必要がある。
 
-安全性はモデルを信頼することではなく、コードに頼る — ツール実行前に判断を挟む。
+ループはすぐにこうなる：
+
+```python
+def agent_loop(messages):
+    while True:
+        # ... LLM call ...
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            log_to_file(block)          # 一行追加
+            check_permission(block)     # 一行追加
+            notify_slack(block)         # さらに一行追加
+            output = execute(block)
+            auto_git_add(block)         # さらに一行追加
+            # ... もうループが見えない
+```
+
+拡張したいのは Agent の振る舞いなのに、変更しているのはループそのもの。ループは安定した核心であるべき。拡張は外側に掛ける。
 
 ---
 
 ## ソリューション
 
-![Permission Overview](images/permission-overview.ja.svg)
+![Hooks Overview](images/hooks-overview.ja.svg)
 
-s02 のループは完全に維持される。唯一の変更は、ツール実行前に `check_permission()` を挿入すること — 各ツール呼び出しは 3 つのゲートを固定順序で通過する：ハード拒否が最優先、次にソフト確認、どちらも一致しなければ許可。
+s03 のループと権限ロジックは完全に保持される。唯一の変更点は `check_permission()` をループ本体内からフックに移動したこと。ループはもうチェック関数を直接呼び出さず、代わりに `trigger_hooks("PreToolUse", block)` を呼び、登録済みのフックが何を実行するかを決める。
 
-3 つのゲートは 3 つの決定に対応する：
+4 つのイベントで、完全な agent cycle をカバー：
 
-| ゲート | 役割 | 一致時 |
-|--------|------|--------|
-| 1. 拒否リスト | 常に禁止される操作（`rm -rf /`、`sudo`） | 即座に拒否、実行しない |
-| 2. ルールマッチング | コンテキスト依存の操作（作業ディレクトリ外への読み書き、`rm` ファイル） | ゲート 3 へ |
-| 3. ユーザー承認 | ゲート 2 が一致した場合、ユーザー確認を待機 | ユーザーが許可または拒否を決定 |
+| イベント | 発火タイミング | 典型的な用途 |
+|----------|--------------|-------------|
+| UserPromptSubmit | ユーザー入力後、LLM に入る前 | 入力バリデーション、コンテキスト注入 |
+| PreToolUse | ツール実行前 | 権限チェック、ログ記録 |
+| PostToolUse | ツール実行後 | 副作用（自動 git add など）、出力チェック |
+| Stop | ループが終了する直前 | 後処理、ループを続行するかの判断 |
 
-3 つのゲートのどれにも一致しない → 直接実行。日常の操作の大部分はこの経路を通る。
+拡張は `register_hook()` で追加する。ループは `trigger_hooks()` を呼ぶだけ。
 
 ---
 
 ## 仕組み
 
-![Permission Pipeline](images/permission-pipeline.ja.svg)
-
-**ゲート 1**：ハード拒否リスト。最初に確認し、一致すればブロックメッセージを返す。このリストは権限ゲートの位置を示すための単純な文字列照合であり、完全なセキュリティ境界ではない。
+**フック登録簿**：イベント名をコールバックリストにマッピングする辞書。
 
 ```python
-DENY_LIST = [
-    "rm -rf /", "sudo", "shutdown", "reboot",
-    "mkfs", "dd if=", "> /dev/sda",
-]
+HOOKS = {
+    "UserPromptSubmit": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "Stop": [],
+}
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:   # 戻り値 ≠ None → フックが「止め」と指示
+            return result
     return None
 ```
 
-**ゲート 2**：ルールマッチング — 「いつユーザーに聞くべきか」を記述する。各ルールはツールとチェック条件を指定する。
+`PreToolUse` が `None` 以外を返すと、現在のツール実行は中止される。`Stop` が `None` 以外を返すと、ループは続行する。`UserPromptSubmit` と `PostToolUse` の戻り値は制御フローに影響しない。
+
+**UserPromptSubmit** はユーザー入力後、LLM に入る前に発火する。以下の hook は現在の作業ディレクトリを記録する：
 
 ```python
-import re
+def context_inject_hook(query: str) -> str | None:
+    """Inject current working directory info into every prompt."""
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    return None   # return None = 変更なし、プロンプトを通す
 
-DESTRUCTIVE_COMMAND_WORD = re.compile(
-    r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
-)
-
-def contains_destructive_command(command: str) -> bool:
-    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
-
-PERMISSION_RULES = [
-    {
-        "tools": ["read_file", "write_file", "edit_file"],
-        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-        "message": "Access outside workspace",
-    },
-    {
-        "tools": ["bash"],
-        "check": lambda args: contains_destructive_command(args.get("command", "")) or any(
-            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
-        ),
-        "message": "Potentially destructive command",
-    },
-]
-
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
+register_hook("UserPromptSubmit", context_inject_hook)
 ```
 
-**ゲート 3**：ルールが一致した後、ユーザー入力を待機。
+メインループでは、ユーザー入力直後に発火：
 
 ```python
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n⚠  {reason}")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+query = input("s04 >> ")
+trigger_hooks("UserPromptSubmit", query)   # ← LLM に入る前
+history.append({"role": "user", "content": query})
+agent_loop(history)
 ```
 
-**3 つのゲートを直列に接続**、ツール実行前に挿入する：
+**PreToolUse / PostToolUse**、ツール実行の前後のフック。s03 の権限チェックロジックは PreToolUse フックに包まれ、さらにログフックと大出力リマインダーが追加される：
 
 ```python
-def check_permission(block) -> bool:
-    # ゲート 1: ハード拒否
+# PreToolUse: 権限チェック（s03 のロジック、ループからフックに移動）
+def permission_hook(block):
     if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n⛔ {reason}")
-            return False
+        for pattern in DENY_LIST:
+            if pattern in block.input.get("command", ""):
+                return "Permission denied by deny list"
+    if block.name in ("read_file", "write_file", "edit_file"):
+        path = block.input.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
 
-    # ゲート 2 + 3: ルールマッチング → ユーザー承認
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
+# PreToolUse: ログ
+def log_hook(block):
+    print(f"[HOOK] {block.name}(...)")
 
-    return True
+# PostToolUse: 大ファイルリマインダー
+def large_output_hook(block, output):
+    if len(str(output)) > 100000:
+        print(f"[HOOK] ⚠ Large output from {block.name}")
 
-# agent_loop で — s02 のループに 1 行追加するだけ：
-for block in tool_calls:
-    if not check_permission(block):           # ← 新規
-        results.append({... "content": "Permission denied."})
-        continue
-    output = TOOL_HANDLERS[block.name](**block.input)  # s02 既存
-    results.append(...)
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PostToolUse", large_output_hook)
 ```
+
+**Stop** はループが終了する直前に発火する。以下の hook は終了時の統計を出力する：
+
+```python
+def summary_hook(messages: list) -> str | None:
+    """Print a summary when the loop is about to stop."""
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    return None   # return None = 終了を許可、return 文字列 = 強制続行
+
+register_hook("Stop", summary_hook)
+```
+
+agent_loop 内では、終了前に発火：
+
+```python
+tool_calls = [
+    block for block in response.content if block.type == "tool_use"
+]
+if not tool_calls:
+    force = trigger_hooks("Stop", messages)   # ← 終了する前に
+    if force:
+        # フックがメッセージを返した → 注入して続行
+        messages.append({"role": "user", "content": force})
+        continue
+    return
+```
+
+**ループ内で変更されたのは一箇所だけ**：s03 は直接 `check_permission(block)` を呼び出していたが、s04 は `trigger_hooks("PreToolUse", block)` に置き換えた：
+
+```python
+for block in tool_calls:
+    # s03: if not check_permission(block): ...
+    # s04: フックがハードコードを代替
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked:
+        results.append({"type": "tool_result", "tool_use_id": block.id,
+                        "content": str(blocked)})
+        continue
+
+    handler = TOOL_HANDLERS.get(block.name)
+    output = handler(**block.input) if handler else f"Unknown: {block.name}"
+
+    trigger_hooks("PostToolUse", block, output)
+
+    results.append({"type": "tool_result", "tool_use_id": block.id,
+                    "content": output})
+```
+
+4 つのフックが agent cycle の重要ノードをカバー：入力→実行前→実行後→終了。ループは trigger_hooks() を呼ぶだけで、具体的なロジックは全てフックコールバックにある。
 
 ---
 
-## s02 からの変更点
+## s03 からの変更
 
-| コンポーネント | 変更前 (s02) | 変更後 (s03) |
-|---------------|-------------|-------------|
-| セキュリティモデル | なし（モデルを信頼） | 3 ゲート権限パイプライン |
-| 新規関数 | — | check_deny_list, check_rules, ask_user, check_permission |
-| ループ | すべてのツールを直接実行 | 実行前に check_permission() を挿入 |
+| コンポーネント | 変更前 (s03) | 変更後 (s04) |
+|--------------|-------------|-------------|
+| 拡張方式 | check_permission() をループ内にハードコード | HOOKS 登録簿 + trigger_hooks() |
+| 新規関数 | — | register_hook, trigger_hooks |
+| フックコールバック | — | context_inject_hook, permission_hook, log_hook, large_output_hook, summary_hook |
+| ループ | check_permission() を直接呼び出し | trigger_hooks("PreToolUse", ...) を呼び出し |
+| 終了制御 | なし | trigger_hooks("Stop", ...) が終了を阻止可能 |
+| 入力横取り | なし | trigger_hooks("UserPromptSubmit", ...) がコンテキスト注入可能 |
 
 ---
 
@@ -143,26 +201,24 @@ for block in tool_calls:
 
 ```sh
 cd learn-claude-code
-python s03_permission/code.py
+python s04_hooks/code.py
 ```
 
 以下のプロンプトを試してみよう：
 
-1. `Create a file called test.txt in the current directory`（そのまま通過するはず）
-2. `Delete the file test.txt`（bash + rm でゲート 2 が発動）
-3. `What files are in the current directory?`（読み取り専用、すべて通過）
-4. `Try to write a file to /etc/something`（作業ディレクトリ外への書き込みでゲート 2 が発動）
-5. Windows では `del test.txt` と `DEL test.txt` がゲート 2 を発動し、`model`、`delimiter`、`echo del test.txt` は発動しない。
+1. `Read the file README.md`（そのまま通過するはず、フックログを観察）
+2. `Create a file called test.txt`（作成後、PostToolUse が発火するか観察）
+3. `Delete all temporary files in /tmp`（bash + rm で権限フックが発動）
 
-観察のポイント：どの操作がそのまま通過するか？ どれに確認が必要か？ どれが即座に拒否されるか？
+観察のポイント：各ツール実行前に `[HOOK]` ログが表示されるか？ 権限が拒否されたとき、フックが拦截したのか、ループ内のハードコードが拦截したのか？
 
 ---
 
 ## 次へ
 
-権限チェックは実装された — しかし、毎回ループ内に `check_permission()` をハードコードしている。ツール実行の前後にログを追加したい場合は？ 特定の操作後に自動的に git commit をトリガーしたい場合は？ このような拡張ロジックがループ内に散らばると、ループはすぐに膨張する。
+Agent は安全に操作を実行できるようになった。しかし「まず何をして、次に何をすべきか」を立ち止まって考えたことはあるか？ 複雑なタスクを与えたとき、すぐに取り掛かるのか、まず計画を立てるのか？
 
-→ s04 Hooks：ループにフックを追加する。拡張ロジックはフックにぶら下げ、ループはクリーンに保つ。
+→ s05 TodoWrite：Agent に計画ツールを与える。まずリストを作り、それから実行。
 
 
 <!-- translation-sync: zh@v1, en@v1, ja@v1 -->

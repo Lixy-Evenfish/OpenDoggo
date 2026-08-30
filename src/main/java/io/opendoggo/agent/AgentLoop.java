@@ -1,11 +1,11 @@
 package io.opendoggo.agent;
 
+import io.opendoggo.hook.HookRunner;
 import io.opendoggo.model.ContentBlock;
 import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.ModelResponse;
 import io.opendoggo.model.ToolResult;
-import io.opendoggo.permission.PermissionChecker;
 import io.opendoggo.tool.ToolDispatch;
 
 import java.io.IOException;
@@ -17,19 +17,22 @@ import java.util.Objects;
  * S1 的核心 Agent Loop。
  *
  * 模型调用工具时继续循环，不调用工具时结束。
- * s03：每次工具执行前先过三道闸门权限检查。
+ * s04：循环只调用 hook 挂载点
+ * （PreToolUse、PostToolUse、Stop），
+ * 具体扩展逻辑全在 HookRunner 注册的回调里，
+ * 循环本身不产生任何控制台输出。
  */
 public final class AgentLoop {
 
     private static final int MAX_TOOL_ROUNDS = 50;
 
     private final ModelClient modelClient;
-    private final PermissionChecker permissionChecker;
+    private final HookRunner hookRunner;
     private final ToolDispatch toolDispatch;
 
     public AgentLoop(
             ModelClient modelClient,
-            PermissionChecker permissionChecker,
+            HookRunner hookRunner,
             ToolDispatch toolDispatch
     ) {
         this.modelClient = Objects.requireNonNull(
@@ -37,9 +40,9 @@ public final class AgentLoop {
                 "modelClient cannot be null"
         );
 
-        this.permissionChecker = Objects.requireNonNull(
-                permissionChecker,
-                "permissionChecker cannot be null"
+        this.hookRunner = Objects.requireNonNull(
+                hookRunner,
+                "hookRunner cannot be null"
         );
 
         this.toolDispatch = Objects.requireNonNull(
@@ -81,7 +84,17 @@ public final class AgentLoop {
                     response.toolCalls();
 
             // 没有工具调用，说明模型决定结束。
+            // s04：Stop hook 有权拒绝退出——
+            // 非 null 返回值注入为 user 消息并继续。
             if (toolCalls.isEmpty()) {
+                String force =
+                        hookRunner.triggerStop(messages);
+
+                if (force != null) {
+                    messages.add(Message.user(force));
+                    continue;
+                }
+
                 return response.text();
             }
 
@@ -90,15 +103,17 @@ public final class AgentLoop {
 
             // 一次模型回复可能包含多个工具调用。
             for (ContentBlock toolCall : toolCalls) {
-                System.out.println("> " + toolCall.name());
-
-                // s03：执行前先过三道闸门；
+                // s04：拦截决定权交给 PreToolUse hook；
+                // 非 null 即拦截原因，
                 // 拒绝也要回带原 id 的 tool_result。
-                if (!permissionChecker.check(toolCall)) {
+                String blocked =
+                        hookRunner.triggerPreToolUse(toolCall);
+
+                if (blocked != null) {
                     results.add(
                             new ToolResult(
                                     toolCall.id(),
-                                    "Permission denied."
+                                    blocked
                             )
                     );
                     continue;
@@ -107,9 +122,13 @@ public final class AgentLoop {
                 String output =
                         toolDispatch.execute(toolCall);
 
-                System.out.println(preview(output));
+                // s04：执行后通知 PostToolUse hook。
+                hookRunner.triggerPostToolUse(
+                        toolCall,
+                        output
+                );
 
-                results.add(new ToolResult(toolCall.id(),output));
+                results.add(new ToolResult(toolCall.id(), output));
 
             }
 
@@ -124,17 +143,6 @@ public final class AgentLoop {
                         + MAX_TOOL_ROUNDS
                         + " tool rounds"
         );
-    }
-
-    /**
-     * 控制台只预览前 200 字符，完整输出仍回传给模型。
-     */
-    private static String preview(String output) {
-        if (output.length() <= 200) {
-            return output;
-        }
-
-        return output.substring(0, 200);
     }
 
 }

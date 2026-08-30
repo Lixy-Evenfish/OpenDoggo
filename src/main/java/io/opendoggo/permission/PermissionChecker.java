@@ -12,7 +12,8 @@ import com.fasterxml.jackson.databind.JsonNode;
 import io.opendoggo.model.ContentBlock;
 
 /*
- 三道闸门权限管线，由 AgentLoop 在toolDispatch.execute 之前调用：
+ 三道闸门权限管线，由 Main 注册的 PreToolUse hook
+ 在 toolDispatch.execute 之前调用：
  
  硬拒绝表：永远禁止，直接拒绝不询问；
  规则匹配：命中后升级到闸门 3；
@@ -80,6 +81,13 @@ public final class PermissionChecker {
                             text(input, "command")
                     ),
                     "Potentially destructive command"
+            ),
+            new Rule(
+                    Set.of(BASH),
+                    input -> referencesOutsideWorkspace(
+                            text(input, "command")
+                    ),
+                    "Access outside workspace"
             )
     );
 
@@ -103,9 +111,11 @@ public final class PermissionChecker {
     }
 
     /**
-     * 三道闸门串在一起，返回 true 才允许执行。
+     * 三道闸门串在一起。
+     * 返回 null 允许执行；返回非 null 为拒绝原因，
+     * 直接成为带原 tool_use_id 的 tool_result 内容。
      */
-    public boolean check(ContentBlock toolCall) {
+    public String check(ContentBlock toolCall) {
         JsonNode input = toolCall.input();
 
         // 闸门 1：硬拒绝，直接拦截不询问。
@@ -118,7 +128,7 @@ public final class PermissionChecker {
                             "[blocked] '" + pattern
                                     + "' is on the deny list"
                     );
-                    return false;
+                    return "Permission denied by deny list";
                 }
             }
         }
@@ -132,11 +142,13 @@ public final class PermissionChecker {
                         toolCall.name(),
                         input,
                         rule.message()
-                );
+                )
+                        ? null
+                        : "Permission denied by user";
             }
         }
 
-        return true;
+        return null;
     }
 
     private static String text(
@@ -173,5 +185,66 @@ public final class PermissionChecker {
 
         return DESTRUCTIVE_KEYWORDS.stream()
                 .anyMatch(command::contains);
+    }
+
+    /**
+     * 闸门 2 的 bash 跨区规则（教学级启发式）：
+     * 按空白切分命令，任何"看起来是路径"的 token——
+     * 父目录跳转（.. 段）、~ 开头、或工作区之外的绝对路径——
+     * 都视为访问工作区外，升级审批。
+     * 引号内含空格的路径、等号粘连的附件（如 --prefix=/x）识别不了。
+     */
+    private boolean referencesOutsideWorkspace(
+            String command
+    ) {
+        String workdir = workingDirectory.toString();
+
+        for (String token : command.split("\\s+")) {
+            String trimmed = stripQuotes(token);
+
+            if (trimmed.isEmpty()) {
+                continue;
+            }
+
+            boolean parentStep = trimmed.equals("..")
+                    || trimmed.startsWith("../")
+                    || trimmed.contains("/../");
+
+            boolean homeRelative =
+                    trimmed.startsWith("~");
+
+            boolean absoluteOutside =
+                    trimmed.startsWith("/")
+                            && !trimmed.equals(workdir)
+                            && !trimmed.startsWith(
+                            workdir + "/"
+                    );
+
+            if (parentStep
+                    || homeRelative
+                    || absoluteOutside) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private static String stripQuotes(String token) {
+        if (token.length() >= 2) {
+            char first = token.charAt(0);
+            char last = token.charAt(token.length() - 1);
+
+            if ((first == '"' && last == '"')
+                    || (first == '\''
+                    && last == '\'')) {
+                return token.substring(
+                        1,
+                        token.length() - 1
+                );
+            }
+        }
+
+        return token;
     }
 }

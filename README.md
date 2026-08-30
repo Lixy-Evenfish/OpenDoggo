@@ -2,7 +2,7 @@
 
 南大软院推免项目，开源 harness。
 
-Java 实现的最小 AI coding agent，对应 [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) 的 s01–s03 环节（agent loop + 多工具 + 权限管线）。
+Java 实现的最小 AI coding agent：agent loop、多工具、权限管线、hooks。
 
 ## v1
 
@@ -14,15 +14,21 @@ Java 实现的最小 AI coding agent，对应 [learn-claude-code](https://github
 
 功能范围：
 
-- **Agent Loop** — 模型请求工具就继续循环，不请求就返回最终回答，上限 50 轮
-- **五个工具** — `bash` / `read_file` / `write_file` / `edit_file` / `glob`，经 `ToolDispatch` 注册表按名分发（详见下文[工具](#工具)一节）
-- **多工具调用** — 单次模型回复中的多个 tool_use 会依次执行后一并回传
-- **三道闸门权限管线** — 工具执行前依次过硬拒绝表、规则匹配、用户审批（详见下文[权限](#权限)一节）
-- **命令行 REPL** — 多轮对话，历史累积在内存中
-- **Anthropic Messages API 客户端** — 仅用 JDK `HttpClient`，无 SDK 依赖
-- **错误回滚** — 单轮失败时回滚历史，避免残留消息污染后续请求
+- **Agent Loop** — 核心循环支持 Anthropic Messages 格式的 AI 调用（仅 JDK `HttpClient`，无 SDK 依赖）：模型请求工具就继续循环，不请求就返回最终回答，上限 50 轮；单次回复中的多个 tool_use 依次执行后一并回传。外层是命令行 REPL，多轮对话，历史驻留内存
+- **工具注册与调度** — 工具实现统一的 `ToolHandler` 接口、注册进 `ToolDispatch` 按名分发；发给模型的 `tools` 数组由注册表自动生成，新增工具不需要改客户端代码
+- **五种具体工具** — `bash` / `read_file` / `write_file` / `edit_file` / `glob`，覆盖命令执行、读、写、精确编辑与文件查找（详见下文[工具](#工具)一节）
+- **权限控制与错误回退** — 最基础的工具权限控制：执行前依次过硬拒绝表、规则匹配、用户审批三道闸门（详见下文[权限](#权限)一节）；单轮失败时回滚历史，避免残留消息污染后续请求
 
-尚未实现（对应后续环节）：hooks、TodoWrite、子 agent、skill 加载、上下文压缩。
+## v2（进行中）
+
+v2 的主线是让 agent loop 成为稳定内核：扩展点以 hook 形式挂在循环外，新增能力只注册 hook，循环代码不再改动。
+
+功能范围：
+
+- **Hooks** — Agent loop 引入 hook 与 trigger 机制，在 4 个关键位置（`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`）设置挂载点，`AgentLoop` 的代码就此固定，后续扩展只需在 `Main` 注册 hook（权限、横幅、预览已挂上，示例 hook 补全中）
+- **TodoWrite**（尚未完成）— 计划工具，让 agent 显式维护任务清单
+- **SubAgent**（尚未完成）— 子 agent，把独立子任务委派出去
+- **Skill**（尚未完成）— 技能加载机制
 
 ## 环境要求
 
@@ -49,17 +55,9 @@ read -rsp "key: " ANTHROPIC_API_KEY && export ANTHROPIC_API_KEY && echo
 
 ### 可用模型
 
-客户端只说 Anthropic Messages 协议。用 [OpenCode Zen](https://opencode.ai/docs/zen/) 时，仅 `/v1/messages` 端点的模型可用：
+客户端只说 Anthropic Messages 协议，因此**任何支持 Anthropic 格式的模型**都可以接入——官方 Claude 系列，以及各厂商提供的 Anthropic 兼容端点均可。
 
-```
-claude-opus-5      claude-sonnet-5     claude-haiku-4-5
-claude-opus-4-5    claude-sonnet-4-6   claude-fable-5
-qwen3.7-max        qwen3.5-plus        ...
-```
-
-`gpt-*`、`gemini-*`、`glm-*`、`kimi-*`、`deepseek-*` 走的是其他协议，不兼容。
-
-`MODEL_ID` 填裸 id，不加 `opencode/` 前缀。
+本项目设计时使用的是 **GLM Coding Plan**（智谱）的 **GLM-5.3**，即上文 `.env` 示例那组配置：`ANTHROPIC_BASE_URL=https://open.bigmodel.cn/api/anthropic`、`MODEL_ID=glm-5.3`。
 
 ## 构建运行
 
@@ -123,10 +121,11 @@ s03 权限管线（`io.opendoggo.permission.PermissionChecker`）插在 `AgentLo
 | 闸门 | 检查 | 命中后果 |
 |------|------|----------|
 | 1. 硬拒绝表 | 7 条子串（`rm -rf /`、`sudo`、`shutdown`、`reboot`、`mkfs`、`dd if=`、`> /dev/sda`），仅对 bash | 直接拒绝，不询问 |
-| 2. 规则匹配 | 文件工具路径逸出工作区；bash 命中破坏性正则（`rm`/`del` 为独立命令词，`model`、`echo del x` 不误伤）或关键字 `rm `、`> /etc/`、`chmod 777` | 升级到闸门 3 |
+| 2. 规则匹配 | 文件工具路径逸出工作区；bash 命中破坏性正则（`rm`/`del` 为独立命令词，`model`、`echo del x` 不误伤）或关键字 `rm `、`> /etc/`、`chmod 777`；bash 引用工作区外路径（`..` 段、`~`、工作区外绝对路径，教学级 token 启发式） | 升级到闸门 3 |
 | 3. 用户审批 | 打印原因与工具调用，提示 `Allow? [y/N]` | 默认拒绝，仅 y/yes 放行 |
 
 - 未登记规则的工具（如 `glob`）三道闸门都不会命中，直接放行
+- bash 跨区检测按空白切分命令逐 token 判断：引号内含空格的路径、等号粘连的选项（如 `--prefix=/x`）识别不了
 - 被拒调用仍回传带原 `tool_use_id` 的 `tool_result`，内容为 `Permission denied.`，消息协议不变
 - 审批交互经 `ApprovalPrompt` 回调注入，权限层与 `AgentLoop` 不直接碰控制台
 - 同 s02：子串与正则匹配属教学级防护，不是安全边界
@@ -192,3 +191,7 @@ io.opendoggo
 ## 许可
 
 见 [LICENSE](LICENSE)。
+
+## 参考
+
+- [learn-claude-code](https://github.com/shareAI-lab/learn-claude-code) — 本项目参考的教学课程，按其环节逐步实现：s01 agent loop、s02 工具调度、s03 权限管线、s04 hooks，以及后续的 TodoWrite / 子 agent / skill 等。

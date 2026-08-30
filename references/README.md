@@ -1,141 +1,199 @@
-# s03: Permission — Check Permissions Before Execution
+# s04: Hooks — Hang on the Loop, Don't Write into It
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-s01 → s02 → `s03` → [s04](../s04_hooks/) → s05 → ... → s16 → s17
-> *"Check permissions before executing"* — The permission pipeline decides which operations need approval.
+s01 → s02 → s03 → `s04` → [s05](../s05_todo_write/) → s06 → ... → s16 → s17
+
+> *"Hang on the loop, don't write into it"* — Hooks inject extension logic before and after tool execution.
 >
-> **Harness Layer**: Permission — a gate before tool execution.
+> **Harness Layer**: Hooks — Extension points that don't invade the loop.
 
 ---
 
 ## The Problem
 
-s02's Agent has 5 tools. File tools are protected by `safe_path`, but bash is unrestricted. Ask it to "clean up the project," and it might run `rm -rf /`.
+The s03 Agent has permission checks. But every new check, "log every bash call", "auto git add after writes", requires modifying the `agent_loop` function.
 
-Safety can't rely on trusting the model — it needs code: a check before every tool execution.
+The loop quickly becomes this:
+
+```python
+def agent_loop(messages):
+    while True:
+        # ... LLM call ...
+        for block in response.content:
+            if block.type != "tool_use":
+                continue
+            log_to_file(block)          # added a line
+            check_permission(block)     # added a line
+            notify_slack(block)         # added another line
+            output = execute(block)
+            auto_git_add(block)         # yet another line
+            # ... the loop is unrecognizable
+```
+
+What you want to extend is the Agent's behavior, but what you're modifying is the loop itself. The loop should be a stable core; extensions should hang on the outside.
 
 ---
 
 ## The Solution
 
-![Permission Overview](images/permission-overview.en.svg)
+![Hooks Overview](images/hooks-overview.en.svg)
 
-s02's loop is fully preserved. The only change is inserting `check_permission()` before tool execution — each tool call passes through three gates in a fixed order: hard deny first, then soft ask, and if neither matches, allow.
+The s03 loop and permission logic are fully preserved. The only change is moving `check_permission()` from inside the loop body onto a hook. The loop no longer directly calls any check function. Instead it calls `trigger_hooks("PreToolUse", block)`, and the registry decides what to run.
 
-The three gates correspond to three decisions:
+Four events, covering a complete agent cycle:
 
-| Gate | Purpose | On Match |
-|------|---------|----------|
-| 1. Deny List | Permanently forbidden operations (`rm -rf /`, `sudo`) | Denied immediately, not executed |
-| 2. Rule Matching | Context-dependent operations (reading/writing outside workspace, `rm` files) | Passed to Gate 3 |
-| 3. User Approval | After Gate 2 matches, pauses for user confirmation | User decides allow or deny |
+| Event | Trigger Timing | Typical Use |
+|-------|---------------|-------------|
+| UserPromptSubmit | After user input, before entering LLM | Input validation, context injection |
+| PreToolUse | Before tool execution | Permission checks, logging |
+| PostToolUse | After tool execution | Side effects (auto git add etc.), output checking |
+| Stop | When the loop is about to exit | Cleanup, decide whether the loop continues |
 
-None of the three gates match → execute directly. Most routine operations take this path.
+Extensions are added via `register_hook()`. The loop only calls `trigger_hooks()`.
 
 ---
 
 ## How It Works
 
-![Permission Pipeline](images/permission-pipeline.en.svg)
-
-**Gate 1**: A hard deny list. Check first; if matched, return a block message. This list uses simple string matching to show where the permission gate sits; it is not a complete security boundary.
+**Hook registry**: a dict mapping event names to callback lists.
 
 ```python
-DENY_LIST = [
-    "rm -rf /", "sudo", "shutdown", "reboot",
-    "mkfs", "dd if=", "> /dev/sda",
-]
+HOOKS = {
+    "UserPromptSubmit": [],
+    "PreToolUse": [],
+    "PostToolUse": [],
+    "Stop": [],
+}
 
-def check_deny_list(command: str) -> str | None:
-    for pattern in DENY_LIST:
-        if pattern in command:
-            return f"Blocked: '{pattern}' is on the deny list"
+def register_hook(event: str, callback):
+    HOOKS[event].append(callback)
+
+def trigger_hooks(event: str, *args):
+    for callback in HOOKS[event]:
+        result = callback(*args)
+        if result is not None:   # return value ≠ None → hook says "stop"
+            return result
     return None
 ```
 
-**Gate 2**: Rule matching — describes "when to ask the user." Each rule specifies a tool and a check condition.
+When `PreToolUse` returns non-None, the current tool execution is blocked. When `Stop` returns non-None, the loop continues. Return values from `UserPromptSubmit` and `PostToolUse` do not affect control flow.
+
+**UserPromptSubmit** triggers after user input and before entering the LLM. The following hook records the current working directory:
 
 ```python
-import re
+def context_inject_hook(query: str) -> str | None:
+    """Inject current working directory info into every prompt."""
+    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
+    return None   # return None = no modification, let prompt through
 
-DESTRUCTIVE_COMMAND_WORD = re.compile(
-    r"(?i)(?:^|[;&|()\n])\s*(?:rm|del)(?=\s|$|[;&|()])"
-)
-
-def contains_destructive_command(command: str) -> bool:
-    return bool(DESTRUCTIVE_COMMAND_WORD.search(command))
-
-PERMISSION_RULES = [
-    {
-        "tools": ["read_file", "write_file", "edit_file"],
-        "check": lambda args: not (WORKDIR / args.get("path", "")).resolve().is_relative_to(WORKDIR),
-        "message": "Access outside workspace",
-    },
-    {
-        "tools": ["bash"],
-        "check": lambda args: contains_destructive_command(args.get("command", "")) or any(
-            kw in args.get("command", "") for kw in ["rm ", "> /etc/", "chmod 777"]
-        ),
-        "message": "Potentially destructive command",
-    },
-]
-
-def check_rules(tool_name: str, args: dict) -> str | None:
-    for rule in PERMISSION_RULES:
-        if tool_name in rule["tools"] and rule["check"](args):
-            return rule["message"]
-    return None
+register_hook("UserPromptSubmit", context_inject_hook)
 ```
 
-**Gate 3**: After a rule matches, pause for user input.
+In the main loop, triggered right after user input:
 
 ```python
-def ask_user(tool_name: str, args: dict, reason: str) -> str:
-    print(f"\n⚠  {reason}")
-    print(f"   Tool: {tool_name}({args})")
-    choice = input("   Allow? [y/N] ").strip().lower()
-    return "allow" if choice in ("y", "yes") else "deny"
+query = input("s04 >> ")
+trigger_hooks("UserPromptSubmit", query)   # ← before entering LLM
+history.append({"role": "user", "content": query})
+agent_loop(history)
 ```
 
-**All three gates chained together**, inserted before tool execution:
+**PreToolUse / PostToolUse**, hooks before and after tool execution. s03's permission check logic is now wrapped as a PreToolUse hook, plus a logging hook and a large-output reminder:
 
 ```python
-def check_permission(block) -> bool:
-    # Gate 1: Hard deny
+# PreToolUse: permission check (s03 logic, moved from loop to hook)
+def permission_hook(block):
     if block.name == "bash":
-        reason = check_deny_list(block.input.get("command", ""))
-        if reason:
-            print(f"\n⛔ {reason}")
-            return False
+        for pattern in DENY_LIST:
+            if pattern in block.input.get("command", ""):
+                return "Permission denied by deny list"
+    if block.name in ("read_file", "write_file", "edit_file"):
+        path = block.input.get("path", "")
+        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
+            choice = input("   Allow? [y/N] ").strip().lower()
+            if choice not in ("y", "yes"):
+                return "Permission denied by user"
+    return None
 
-    # Gate 2 + 3: Rule matching → User approval
-    reason = check_rules(block.name, block.input)
-    if reason:
-        decision = ask_user(block.name, block.input, reason)
-        if decision == "deny":
-            return False
+# PreToolUse: logging
+def log_hook(block):
+    print(f"[HOOK] {block.name}(...)")
 
-    return True
+# PostToolUse: large output reminder
+def large_output_hook(block, output):
+    if len(str(output)) > 100000:
+        print(f"[HOOK] ⚠ Large output from {block.name}")
 
-# In agent_loop — s02's loop with just one line added:
-for block in tool_calls:
-    if not check_permission(block):           # ← NEW
-        results.append({... "content": "Permission denied."})
-        continue
-    output = TOOL_HANDLERS[block.name](**block.input)  # s02 original
-    results.append(...)
+register_hook("PreToolUse", permission_hook)
+register_hook("PreToolUse", log_hook)
+register_hook("PostToolUse", large_output_hook)
 ```
+
+**Stop** triggers when the loop is about to exit. The following hook prints a cleanup summary:
+
+```python
+def summary_hook(messages: list) -> str | None:
+    """Print a summary when the loop is about to stop."""
+    tool_count = sum(1 for m in messages
+                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
+                     if isinstance(b, dict) and b.get("type") == "tool_result")
+    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
+    return None   # return None = allow stop, return string = force continuation
+
+register_hook("Stop", summary_hook)
+```
+
+In agent_loop, triggered before exit:
+
+```python
+tool_calls = [
+    block for block in response.content if block.type == "tool_use"
+]
+if not tool_calls:
+    force = trigger_hooks("Stop", messages)   # ← before exiting
+    if force:
+        # hook returned a message → inject it and continue
+        messages.append({"role": "user", "content": force})
+        continue
+    return
+```
+
+**Only one change in the loop**: s03 directly called `check_permission(block)`, s04 replaces it with `trigger_hooks("PreToolUse", block)`:
+
+```python
+for block in tool_calls:
+    # s03: if not check_permission(block): ...
+    # s04: hooks replace hardcoding
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked:
+        results.append({"type": "tool_result", "tool_use_id": block.id,
+                        "content": str(blocked)})
+        continue
+
+    handler = TOOL_HANDLERS.get(block.name)
+    output = handler(**block.input) if handler else f"Unknown: {block.name}"
+
+    trigger_hooks("PostToolUse", block, output)
+
+    results.append({"type": "tool_result", "tool_use_id": block.id,
+                    "content": output})
+```
+
+Four hooks cover the critical nodes of the agent cycle: input → before execution → after execution → exit. The loop only calls trigger_hooks(); all logic lives in hook callbacks.
 
 ---
 
-## Changes from s02
+## Changes from s03
 
-| Component | Before (s02) | After (s03) |
+| Component | Before (s03) | After (s04) |
 |-----------|-------------|-------------|
-| Security model | None (trust the model) | Three-gate permission pipeline |
-| New functions | — | check_deny_list, check_rules, ask_user, check_permission |
-| Loop | Executes all tools directly | Inserts check_permission() before execution |
+| Extension method | check_permission() hardcoded in the loop | HOOKS registry + trigger_hooks() |
+| New functions | — | register_hook, trigger_hooks |
+| Hook callbacks | — | context_inject_hook, permission_hook, log_hook, large_output_hook, summary_hook |
+| Loop | Directly calls check_permission() | Calls trigger_hooks("PreToolUse", ...) |
+| Exit control | None | trigger_hooks("Stop", ...) can prevent exit |
+| Input interception | None | trigger_hooks("UserPromptSubmit", ...) can inject context |
 
 ---
 
@@ -143,26 +201,24 @@ for block in tool_calls:
 
 ```sh
 cd learn-claude-code
-python s03_permission/code.py
+python s04_hooks/code.py
 ```
 
 Try these prompts:
 
-1. `Create a file called test.txt in the current directory` (should pass through)
-2. `Delete the file test.txt` (bash + rm triggers Gate 2)
-3. `What files are in the current directory?` (read-only, all pass)
-4. `Try to write a file to /etc/something` (writing outside workspace triggers Gate 2)
-5. On Windows, `del test.txt` and `DEL test.txt` trigger Gate 2, while `model`, `delimiter`, and `echo del test.txt` do not.
+1. `Read the file README.md` (should pass directly, observe hook logs)
+2. `Create a file called test.txt` (after creation, observe if PostToolUse fires)
+3. `Delete all temporary files in /tmp` (bash + rm triggers permission hook)
 
-What to watch for: Which operations pass through? Which need your confirmation? Which are denied outright?
+What to watch for: Before each tool execution, does the `[HOOK]` log appear? When permission is denied, was it intercepted by a hook or hardcoded in the loop?
 
 ---
 
 ## What's Next
 
-Permission checks are in place — but every check is hardcoded as `check_permission()` inside the loop. What if you want to add logging before and after each tool execution? What if you want to auto-trigger a git commit after certain operations? Scattering this extension logic throughout the loop makes it bloat.
+The Agent can now safely execute operations. But does it ever stop to think "what should I do first, and what next?" Given a complex task, does it jump straight in, or plan first?
 
-→ s04 Hooks: Add hooks to the loop. Extension logic hangs on hooks; the loop stays clean.
+→ s05 TodoWrite: Give the Agent a planning tool. Make a list first, then execute.
 
 
 <!-- translation-sync: zh@v1, en@v1, ja@v1 -->
