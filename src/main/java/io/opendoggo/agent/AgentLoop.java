@@ -5,6 +5,7 @@ import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.ModelResponse;
 import io.opendoggo.model.ToolResult;
+import io.opendoggo.permission.PermissionChecker;
 import io.opendoggo.tool.ToolDispatch;
 
 import java.io.IOException;
@@ -16,22 +17,29 @@ import java.util.Objects;
  * S1 的核心 Agent Loop。
  *
  * 模型调用工具时继续循环，不调用工具时结束。
+ * s03：每次工具执行前先过三道闸门权限检查。
  */
 public final class AgentLoop {
 
     private static final int MAX_TOOL_ROUNDS = 50;
 
     private final ModelClient modelClient;
+    private final PermissionChecker permissionChecker;
     private final ToolDispatch toolDispatch;
 
     public AgentLoop(
             ModelClient modelClient,
+            PermissionChecker permissionChecker,
             ToolDispatch toolDispatch
-            
     ) {
         this.modelClient = Objects.requireNonNull(
                 modelClient,
                 "modelClient cannot be null"
+        );
+
+        this.permissionChecker = Objects.requireNonNull(
+                permissionChecker,
+                "permissionChecker cannot be null"
         );
 
         this.toolDispatch = Objects.requireNonNull(
@@ -83,6 +91,18 @@ public final class AgentLoop {
             // 一次模型回复可能包含多个工具调用。
             for (ContentBlock toolCall : toolCalls) {
                 System.out.println("> " + toolCall.name());
+
+                // s03：执行前先过三道闸门；
+                // 拒绝也要回带原 id 的 tool_result。
+                if (!permissionChecker.check(toolCall)) {
+                    results.add(
+                            new ToolResult(
+                                    toolCall.id(),
+                                    "Permission denied."
+                            )
+                    );
+                    continue;
+                }
 
                 String output =
                         toolDispatch.execute(toolCall);

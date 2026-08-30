@@ -66,14 +66,13 @@ public final class WriteFileTool implements ToolHandler {
 
         String rawPath = input.path("path").asText(null);
 
-        Path path = WorkspacePaths.resolveIn(
+        Path path = WorkspacePaths.resolveAny(
                 workingDirectory,
                 rawPath
         );
 
         if (path == null) {
-            return "Error: path escapes workspace: "
-                    + rawPath;
+            return "Error: path cannot be empty";
         }
 
         String content = input.path("content").asText();

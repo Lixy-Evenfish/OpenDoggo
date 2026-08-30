@@ -70,14 +70,13 @@ public final class EditFileTool implements ToolHandler {
 
         String rawPath = input.path("path").asText(null);
 
-        Path path = WorkspacePaths.resolveIn(
+        Path path = WorkspacePaths.resolveAny(
                 workingDirectory,
                 rawPath
         );
 
         if (path == null) {
-            return "Error: path escapes workspace: "
-                    + rawPath;
+            return "Error: path cannot be empty";
         }
 
         String oldText = input.path("old_text").asText("");

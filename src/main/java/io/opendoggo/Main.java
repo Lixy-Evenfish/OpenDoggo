@@ -5,6 +5,8 @@ import io.opendoggo.environment.Env;
 import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.impl.AnthropicClient;
+import io.opendoggo.permission.ApprovalPrompt;
+import io.opendoggo.permission.PermissionChecker;
 import io.opendoggo.tool.ToolDispatch;
 import io.opendoggo.tool.impl.EditFileTool;
 import io.opendoggo.tool.impl.GlobTool;
@@ -61,13 +63,16 @@ public final class Main {
         Path workingDirectory =
                 Path.of("").toAbsolutePath().normalize();
 
-        // 与 s2 的 SYSTEM 一致，把工作目录写进提示词。
+        // 与 s2 的 SYSTEM 一致，把工作目录写进提示词；
+        // s03 增加破坏性操作需审批的声明。
         String systemPrompt =
                 "You are a coding agent at "
                         + workingDirectory
                         + ". Use the available tools "
                         + "to solve tasks. "
-                        + "Act, don't explain.";
+                        + "Act, don't explain. "
+                        + "All destructive operations "
+                        + "require user approval.";
 
         ToolDispatch toolDispatch = new ToolDispatch();
         toolDispatch.register(new ShellTool(workingDirectory));
@@ -84,12 +89,56 @@ public final class Main {
                 toolDefinitions
         );
 
+        BufferedReader reader = new BufferedReader(
+                new InputStreamReader(
+                        System.in,
+                        StandardCharsets.UTF_8
+                )
+        );
+
+        // 闸门 3 的控制台实现：默认拒绝。
+        ApprovalPrompt approvalPrompt =
+                (toolName, input, reason) -> {
+                    System.out.println();
+                    System.out.println(
+                            "[permission] " + reason
+                    );
+                    System.out.println(
+                            "   Tool: " + toolName
+                                    + "(" + input + ")"
+                    );
+                    System.out.print("   Allow? [y/N] ");
+                    System.out.flush();
+
+                    String choice;
+                    try {
+                        choice = reader.readLine();
+                    } catch (IOException exception) {
+                        choice = null;
+                    }
+
+                    String normalized = choice == null
+                            ? ""
+                            : choice.strip()
+                                    .toLowerCase(Locale.ROOT);
+
+                    return normalized.equals("y")
+                            || normalized.equals("yes");
+                };
+
+        PermissionChecker permissionChecker =
+                new PermissionChecker(
+                        workingDirectory,
+                        approvalPrompt
+                );
+
         AgentLoop agentLoop = new AgentLoop(
                 modelClient,
+                permissionChecker,
                 toolDispatch
         );
 
-        runRepl(agentLoop, workingDirectory);
+        runRepl(agentLoop, workingDirectory, reader);
     }
 
     /**
@@ -97,7 +146,8 @@ public final class Main {
      */
     private static void runRepl(
             AgentLoop agentLoop,
-            Path workingDirectory
+            Path workingDirectory,
+            BufferedReader reader
     ) {
         System.out.println("OpenDoggo s1: Agent Loop");
         System.out.println("cwd: " + workingDirectory);
@@ -108,13 +158,6 @@ public final class Main {
         System.out.println();
 
         List<Message> history = new ArrayList<>();
-
-        BufferedReader reader = new BufferedReader(
-                new InputStreamReader(
-                        System.in,
-                        StandardCharsets.UTF_8
-                )
-        );
 
         while (true) {
             System.out.print("doggo >> ");

@@ -24,15 +24,6 @@ public final class ShellTool implements ToolHandler {
 
     private static final int MAX_OUTPUT_LENGTH = 50000;
 
-    private static final List<String> DANGEROUS_COMMANDS =
-            List.of(
-                    "rm -rf /",
-                    "sudo",
-                    "shutdown",
-                    "reboot",
-                    "> /dev/"
-            );
-
     private final Path workingDirectory;
     private final Duration timeout;
 
@@ -85,11 +76,7 @@ public final class ShellTool implements ToolHandler {
             return "Error: command cannot be empty";
         }
 
-        if (isDangerous(command)) {
-            return "Error: Dangerous command blocked";
-        }
-
-        Process process = null;   
+        Process process = null;
         try {
             
             process = new ProcessBuilder(
@@ -184,14 +171,6 @@ public final class ShellTool implements ToolHandler {
                 "-lc",
                 command
         );
-    }
-
-    private boolean isDangerous(String command) {
-        String normalized =
-                command.toLowerCase(Locale.ROOT);
-
-        return DANGEROUS_COMMANDS.stream()
-                .anyMatch(normalized::contains);
     }
 
     /**
