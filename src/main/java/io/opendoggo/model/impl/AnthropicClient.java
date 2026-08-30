@@ -33,7 +33,7 @@ public final class AnthropicClient implements ModelClient {
 
     private static final String API_VERSION = "2023-06-01";
 
-    private static final int MAX_TOKENS = 8000;
+    private static final int MAX_TOKENS = 48000;
 
     private static final ObjectMapper MAPPER =
             new ObjectMapper();
@@ -157,7 +157,7 @@ public final class AnthropicClient implements ModelClient {
 
         // String → JsonNode。整段 HTTP body 变成可按下标/字段走的树。
         JsonNode root = MAPPER.readTree(body);
-
+        
         // 业务错误在 JSON 里，不在 HTTP 状态码上。
         JsonNode error = root.get("error");
 

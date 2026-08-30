@@ -1,199 +1,124 @@
-# s04: Hooks — 挂在循环上，不写进循环里
+# s05: TodoWrite — 没有计划的 Agent，做着做着就偏了
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-s01 → s02 → s03 → `s04` → [s05](../s05_todo_write/) → s06 → ... → s16 → s17
+s01 → s02 → s03 → s04 → `s05` → [s06](../s06_subagent/) → s07 → ... → s16 → s17
 
-> *"挂在循环上, 不写进循环里"* — hook 在工具执行前后注入扩展逻辑。
+> *"没有计划的 agent 走哪算哪"* — 先列步骤再动手，长任务更不容易漏项。
 >
-> **Harness 层**: hook — 扩展点不侵入循环。
+> **Harness 层**: 规划 — 让 Agent 在动手之前先想清楚。
 
 ---
 
 ## 问题
 
-s03 的 Agent 有权限检查了。但每次加一个新检查，比如"记录每次 bash 调用"、"操作后自动 git add"，都要修改 `agent_loop` 函数。
+给 Agent 一个复杂任务："把所有 Python 文件改成 snake_case 命名，然后跑测试，修好失败。"
 
-循环很快就变成了这样：
+Agent 开始干活，改了 3 个文件，跑了个测试，发现 2 个失败，开始修。修着修着，它忘了最初是"改成 snake_case"，测试失败把注意力全吸走了。
 
-```python
-def agent_loop(messages):
-    while True:
-        # ... LLM call ...
-        for block in response.content:
-            if block.type != "tool_use":
-                continue
-            log_to_file(block)          # 加一行
-            check_permission(block)     # 加一行
-            notify_slack(block)         # 又加一行
-            output = execute(block)
-            auto_git_add(block)         # 再加一行
-            # ... 很快循环就认不出来了
-```
-
-你想扩展的是 Agent 的行为，但你改的却是循环本身。循环应该是一个稳定的核心，扩展应该挂在外面。
+对话越长越严重：工具结果不断填满上下文，系统提示的影响力被稀释。一个 10 步重构，做完 1-3 步就开始即兴发挥，因为 4-10 步已经被挤出注意力了。
 
 ---
 
 ## 解决方案
 
-![Hooks Overview](images/hooks-overview.svg)
+![Todo Overview](images/todo-overview.svg)
 
-s03 的循环和权限逻辑完全保留。唯一的变动是把 `check_permission()` 从循环体内移到了 hook 上，循环不再直接调用任何检查函数，改为 `trigger_hooks("PreToolUse", block)`，由注册表决定跑什么。
+S05 保留 S04 的工具分发、权限检查和 Hooks，再加入 `todo_write` 与 reminder 计数器。`todo_write` 只更新计划状态，实际工作仍由原有工具完成。
 
-四个事件，覆盖一个完整的 agent cycle：
-
-| 事件 | 触发时机 | 典型用途 |
-|------|---------|---------|
-| UserPromptSubmit | 用户输入提交后、进入 LLM 前 | 输入验证、注入上下文 |
-| PreToolUse | 工具执行前 | 权限检查、日志记录 |
-| PostToolUse | 工具执行后 | 副作用（自动 git add 等）、输出检查 |
-| Stop | 循环即将退出时 | 收尾清理、决定是否继续循环 |
-
-扩展通过 `register_hook()` 添加，循环只调用 `trigger_hooks()`。
+新工具仍通过 `TOOL_HANDLERS[block.name]` 分发。连续三个工具调用轮次没有使用 `todo_write` 时，Harness 会把 reminder 追加到第三轮的工具结果中。
 
 ---
 
 ## 工作原理
 
-**hook 注册表**：一个字典，事件名映射到回调列表。
+**TodoManager** 持有内存中的任务列表，负责校验更新，并把渲染结果返回给模型。`run_todo_write` 同时把这份状态打印到终端：
 
 ```python
-HOOKS = {
-    "UserPromptSubmit": [],
-    "PreToolUse": [],
-    "PostToolUse": [],
-    "Stop": [],
-}
+class TodoManager:
+    def __init__(self):
+        self.items = []
 
-def register_hook(event: str, callback):
-    HOOKS[event].append(callback)
+    def update(self, todos: list | str) -> str:
+        # Parse and validate before replacing the current list.
+        validated = []
+        ...
+        self.items = validated
+        return self.render()
 
-def trigger_hooks(event: str, *args):
-    for callback in HOOKS[event]:
-        result = callback(*args)
-        if result is not None:   # 返回值 ≠ None → hook 说"停"
-            return result
-    return None
+    def render(self) -> str:
+        # [ ] pending, [>] in progress, [x] completed
+        ...
+
+
+TODO = TodoManager()
+
+def run_todo_write(todos: list | str) -> str:
+    output = TODO.update(todos)
+    print(output)
+    return output
 ```
 
-`PreToolUse` 返回非 `None` 时，本次工具执行被阻止；`Stop` 返回非 `None` 时，循环继续。`UserPromptSubmit` 和 `PostToolUse` 的返回值不参与控制流。
+一次更新最多包含 20 项；每项都必须有非空的 `content`；同一时间只能有一个 `in_progress`。字符串输入可以是 JSON，也可以是 Python 列表表示，解析过程不使用 `eval`。
 
-**UserPromptSubmit** 在用户输入提交后、进入 LLM 前触发。以下 hook 记录当前工作目录：
-
-```python
-def context_inject_hook(query: str) -> str | None:
-    """Inject current working directory info into every prompt."""
-    print(f"\033[90m[HOOK] UserPromptSubmit: working in {WORKDIR}\033[0m")
-    return None   # return None = no modification, let prompt through
-
-register_hook("UserPromptSubmit", context_inject_hook)
-```
-
-在主循环中，用户输入后立即触发：
+工具定义和其他 5 个工具一起加入 dispatch map：
 
 ```python
-query = input("s04 >> ")
-trigger_hooks("UserPromptSubmit", query)   # ← 进入 LLM 之前
-history.append({"role": "user", "content": query})
-agent_loop(history)
-```
-
-**PreToolUse / PostToolUse**，工具执行前后的 hook。s03 的权限检查逻辑现在包装成 PreToolUse hook，再加一个日志 hook 和一个大输出提醒：
-
-```python
-# PreToolUse: 权限检查（s03 的逻辑，从循环移到 hook）
-def permission_hook(block):
-    if block.name == "bash":
-        for pattern in DENY_LIST:
-            if pattern in block.input.get("command", ""):
-                return "Permission denied by deny list"
-    if block.name in ("read_file", "write_file", "edit_file"):
-        path = block.input.get("path", "")
-        if not (WORKDIR / path).resolve().is_relative_to(WORKDIR):
-            choice = input("   Allow? [y/N] ").strip().lower()
-            if choice not in ("y", "yes"):
-                return "Permission denied by user"
-    return None
-
-# PreToolUse: 日志
-def log_hook(block):
-    print(f"[HOOK] {block.name}(...)")
-
-# PostToolUse: 大文件提醒
-def large_output_hook(block, output):
-    if len(str(output)) > 100000:
-        print(f"[HOOK] ⚠ Large output from {block.name}")
-
-register_hook("PreToolUse", permission_hook)
-register_hook("PreToolUse", log_hook)
-register_hook("PostToolUse", large_output_hook)
-```
-
-**Stop** 在循环即将退出时触发。以下 hook 打印收尾统计：
-
-```python
-def summary_hook(messages: list) -> str | None:
-    """Print a summary when the loop is about to stop."""
-    tool_count = sum(1 for m in messages
-                     for b in (m.get("content") if isinstance(m.get("content"), list) else [])
-                     if isinstance(b, dict) and b.get("type") == "tool_result")
-    print(f"\033[90m[HOOK] Stop: session used {tool_count} tool calls\033[0m")
-    return None   # return None = allow stop, return string = force continuation
-
-register_hook("Stop", summary_hook)
-```
-
-在 agent_loop 中，退出前触发：
-
-```python
-tool_calls = [
-    block for block in response.content if block.type == "tool_use"
+TOOLS = [
+    {"name": "bash",       ...},
+    {"name": "read_file",  ...},
+    {"name": "write_file", ...},
+    {"name": "edit_file",  ...},
+    {"name": "glob",       ...},
+    # s05: 新增一条
+    {"name": "todo_write", "description": "Create and manage a task list ...",
+     "input_schema": {
+         "type": "object",
+         "properties": {
+             "todos": {
+                 "type": "array",
+                 "items": {
+                     "type": "object",
+                     "properties": {
+                         "content": {"type": "string"},
+                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
+                     },
+                 },
+             },
+         },
+     },
+    },
 ]
-if not tool_calls:
-    force = trigger_hooks("Stop", messages)   # ← 退出之前
-    if force:
-        # hook returned a message → inject it and continue
-        messages.append({"role": "user", "content": force})
-        continue
-    return
+
+TOOL_HANDLERS["todo_write"] = run_todo_write
 ```
 
-**循环里只改了一处**：s03 直接调用 `check_permission(block)`，s04 改为 `trigger_hooks("PreToolUse", block)`：
+**Reminder**：连续三个工具调用轮次没有使用 `todo_write` 时，reminder 会追加到第三轮的结果中，随后计数器清零：
 
 ```python
-for block in tool_calls:
-    # s03: if not check_permission(block): ...
-    # s04: hook 替代硬编码
-    blocked = trigger_hooks("PreToolUse", block)
-    if blocked:
-        results.append({"type": "tool_result", "tool_use_id": block.id,
-                        "content": str(blocked)})
-        continue
-
-    handler = TOOL_HANDLERS.get(block.name)
-    output = handler(**block.input) if handler else f"Unknown: {block.name}"
-
-    trigger_hooks("PostToolUse", block, output)
-
-    results.append({"type": "tool_result", "tool_use_id": block.id,
-                    "content": output})
+rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
+if rounds_since_todo >= 3:
+    results.append({
+        "type": "text",
+        "text": "<reminder>Update your todos.</reminder>",
+    })
+    rounds_since_todo = 0
 ```
 
-四个 hook 覆盖了 agent cycle 的关键节点：输入→执行前→执行后→退出。循环只负责调用 trigger_hooks()，具体逻辑全在 hook 回调里。
+Agent 收到任务后的典型流程：先调 `todo_write` 列出所有步骤（全 `pending`）→ 做一个步骤，改成 `in_progress` → 做完改成 `completed` → 看下一个 `pending` → 继续。
+
+**关键洞察**：todo_write 不给 Agent 增加任何**执行能力**。它增加的是**规划能力**。
 
 ---
 
-## 相对 s03 的变更
+## 相对 s04 的变更
 
-| 组件 | 之前 (s03) | 之后 (s04) |
+| 组件 | 之前 (s04) | 之后 (s05) |
 |------|-----------|-----------|
-| 扩展方式 | check_permission() 硬编码在循环里 | HOOKS 注册表 + trigger_hooks() |
-| 新函数 | — | register_hook, trigger_hooks |
-| hook 回调 | — | context_inject_hook, permission_hook, log_hook, large_output_hook, summary_hook |
-| 循环 | 直接调用 check_permission() | 调用 trigger_hooks("PreToolUse", ...) |
-| 退出控制 | 无 | trigger_hooks("Stop", ...) 可阻止退出 |
-| 输入拦截 | 无 | trigger_hooks("UserPromptSubmit", ...) 可注入上下文 |
+| 工具数量 | 5 (bash, read, write, edit, glob) | 6 (+todo_write) |
+| 规划能力 | 无 | 带状态的 TODO 列表 + reminder |
+| SYSTEM 提示 | 通用提示 | 加入 "先计划再执行" 引导 |
+| 循环 | 工具分发与 Hooks | 保留分发路径，加入 rounds_since_todo 和 reminder 注入 |
 
 ---
 
@@ -201,24 +126,24 @@ for block in tool_calls:
 
 ```sh
 cd learn-claude-code
-python s04_hooks/code.py
+python s05_todo_write/code.py
 ```
 
 试试这些 prompt：
 
-1. `Read the file README.md`（应该直接通过，观察 hook 日志）
-2. `Create a file called test.txt`（通过后观察 PostToolUse 是否触发）
-3. `Delete all temporary files in /tmp`（bash + rm 触发权限 hook）
+1. `Refactor s05_todo_write/example/hello.py: add type hints, docstrings, and a main guard`（先列 3 步再执行）
+2. `Create a Python package under s05_todo_write/example/demo_pkg with __init__.py, utils.py, and tests/test_utils.py`
+3. `Review Python files under s05_todo_write/example and fix any style issues`
 
-观察重点：每次工具执行前，是否出现了 `[HOOK]` 日志？权限被拒时，是 hook 拦截的还是循环里硬编码的？
+观察重点：第一次工具调用是不是 `todo_write`？TODO 列了几步？执行过程中状态有没有从 `pending` 变成 `in_progress` / `completed`？
 
 ---
 
 ## 接下来
 
-Agent 现在能安全执行操作了。但它有没有停下来想过"我应该先做什么，再做什么"？给它一个复杂任务，它是一上来就动手，还是先列个计划？
+Agent 能计划了。但如果一个任务太大，比如"重构整个认证模块"，光靠 TODO 列表不够。这个任务本身就是几十个小任务的集合，放在同一个对话里会被上下文淹没。
 
-s05 TodoWrite → 给 Agent 一个计划工具。先列清单，再做。
+s06 Subagent → 把大任务拆成子任务，每个子任务派一个独立的 Agent。它们有自己的干净上下文，不会互相污染。
 
 
-<!-- translation-sync: zh@v1, en@v0, ja@v0 -->
+<!-- translation-sync: zh@v1, en@v1, ja@v1 -->

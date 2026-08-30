@@ -70,4 +70,26 @@ public record Message(String role,JsonNode content) {
         return new Message("user", content);
     }
 
+     public static Message toolResults(
+            List<ToolResult> results,
+            String extraText
+    ) {
+        Objects.requireNonNull(results, "results cannot be null");
+
+        ArrayNode content =
+                JsonNodeFactory.instance.arrayNode();
+
+        for (ToolResult result : results) {
+            content.add(result.toJson());
+        }
+
+        if (extraText != null) {
+            content.addObject()
+                    .put("type", "text")
+                    .put("text", extraText);
+        }
+
+        return new Message("user", content);
+    }
+
 }

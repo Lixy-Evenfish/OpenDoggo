@@ -26,6 +26,15 @@ public final class AgentLoop {
 
     private static final int MAX_TOOL_ROUNDS = 50;
 
+    // s05：连续多少个工具轮次没碰 todo_write
+    // 就注入催更提醒。
+    private static final int TODO_REMINDER_THRESHOLD = 3;
+
+    private static final String TODO_TOOL_NAME = "todo_write";
+
+    private static final String TODO_REMINDER =
+            "<reminder>Update your todos.</reminder>";
+
     private final ModelClient modelClient;
     private final HookRunner hookRunner;
     private final ToolDispatch toolDispatch;
@@ -65,6 +74,7 @@ public final class AgentLoop {
                 "messages cannot be null"
         );
 
+        int roundsSinceTodo = 0;
         for (int round = 0;
              round < MAX_TOOL_ROUNDS;
              round++) {
@@ -100,7 +110,7 @@ public final class AgentLoop {
 
             List<ToolResult> results =
                     new ArrayList<>();
-
+            boolean usedTodo = false;
             // 一次模型回复可能包含多个工具调用。
             for (ContentBlock toolCall : toolCalls) {
                 // s04：拦截决定权交给 PreToolUse hook；
@@ -119,23 +129,41 @@ public final class AgentLoop {
                     continue;
                 }
 
-                String output =
-                        toolDispatch.execute(toolCall);
+                // s05：工具异常不再炸掉循环，
+                // 转成 Error 工具结果回传给模型。
+                String output;
+
+                try {
+                    output = toolDispatch.execute(toolCall);
+                } catch (Exception exception) {
+                    output = "Error: " + exception.getMessage();
+                }
+
+                // s05：内容统一转字符串，
+                // 防止 null 进入 tool_result
+                // （ToolResult 的 content 是非空约束）。
+                output = String.valueOf(output);
 
                 // s04：执行后通知 PostToolUse hook。
                 hookRunner.triggerPostToolUse(
                         toolCall,
                         output
                 );
-
+                if (TODO_TOOL_NAME.equals(toolCall.name())) {
+                    usedTodo = true;
+                }
                 results.add(new ToolResult(toolCall.id(), output));
 
             }
+            roundsSinceTodo = usedTodo ? 0 : roundsSinceTodo + 1;
 
-            // 工具结果以 user 消息返回给模型。
-            messages.add(
-                    Message.toolResults(results)
-            );
+            String reminder = null;
+            if (roundsSinceTodo >= TODO_REMINDER_THRESHOLD) {
+                reminder = TODO_REMINDER;
+                roundsSinceTodo = 0;
+            }
+
+            messages.add(Message.toolResults(results, reminder));
         }
 
         throw new IllegalStateException(

@@ -6,13 +6,14 @@ import io.opendoggo.hook.HookRunner;
 import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.impl.AnthropicClient;
-import io.opendoggo.permission.ApprovalPrompt;
+import io.opendoggo.permission.ConsoleApprovalPrompt;
 import io.opendoggo.permission.PermissionChecker;
 import io.opendoggo.tool.ToolDispatch;
 import io.opendoggo.tool.impl.EditFileTool;
 import io.opendoggo.tool.impl.GlobTool;
 import io.opendoggo.tool.impl.ReadFileTool;
 import io.opendoggo.tool.impl.ShellTool;
+import io.opendoggo.tool.impl.TodoWrite;
 import io.opendoggo.tool.impl.WriteFileTool;
 
 import java.io.BufferedReader;
@@ -66,22 +67,23 @@ public final class Main {
                 Path.of("").toAbsolutePath().normalize();
 
         // 与 s2 的 SYSTEM 一致，把工作目录写进提示词；
-        // s03 增加破坏性操作需审批的声明。
+        // s03 增加破坏性操作需审批的声明；
+        // s05 增加先计划再执行的引导。
         String systemPrompt =
                 "You are a coding agent at "
                         + workingDirectory
                         + ". Use the available tools "
                         + "to solve tasks. "
                         + "Act, don't explain. "
+                        + "Before starting any "
+                        + "multi-step task, use "
+                        + "todo_write to plan your "
+                        + "steps. Update status as "
+                        + "you go. "
                         + "All destructive operations "
                         + "require user approval.";
 
-        ToolDispatch toolDispatch = new ToolDispatch();
-        toolDispatch.register(new ShellTool(workingDirectory));
-        toolDispatch.register(new ReadFileTool(workingDirectory));
-        toolDispatch.register(new WriteFileTool(workingDirectory));
-        toolDispatch.register(new EditFileTool(workingDirectory));
-        toolDispatch.register(new GlobTool(workingDirectory));
+        ToolDispatch toolDispatch = initTools(workingDirectory);
         ArrayNode toolDefinitions = toolDispatch.toolDefinitions();
         ModelClient modelClient = new AnthropicClient(
                 baseUrl,
@@ -99,49 +101,58 @@ public final class Main {
         );
 
         // 闸门 3 的控制台实现：默认拒绝。
-        ApprovalPrompt approvalPrompt =
-                (toolName, input, reason) -> {
-                    System.out.println();
-                    System.out.println(
-                            "[permission] " + reason
-                    );
-                    System.out.println(
-                            "   Tool: " + toolName
-                                    + "(" + input + ")"
-                    );
-                    System.out.print("   Allow? [y/N] ");
-                    System.out.flush();
-
-                    String choice;
-                    try {
-                        choice = reader.readLine();
-                    } catch (IOException exception) {
-                        choice = null;
-                    }
-
-                    String normalized = choice == null
-                            ? ""
-                            : choice.strip()
-                                    .toLowerCase(Locale.ROOT);
-
-                    return normalized.equals("y")
-                            || normalized.equals("yes");
-                };
-
         PermissionChecker permissionChecker =
                 new PermissionChecker(
                         workingDirectory,
-                        approvalPrompt
+                        new ConsoleApprovalPrompt(reader)
                 );
 
-        // s04：循环只认 HookRunner。以下按 agent 周期
-        // （输入 → 执行前 → 执行后 → 退出）注册全部 hook。
+        HookRunner hookRunner = initHooks(
+                permissionChecker,
+                workingDirectory
+        );
+
+        AgentLoop agentLoop = new AgentLoop(
+                modelClient,
+                hookRunner,
+                toolDispatch
+        );
+
+        runRepl(agentLoop, hookRunner, workingDirectory, reader);
+    }
+
+    /**
+     * 工具装配：创建注册表并登记全部工具。
+     * 新增工具 = 实现 ToolHandler 后在这里登记一行，
+     * tools 数组由注册表自动生成。
+     */
+    private static ToolDispatch initTools(Path workingDirectory) {
+        ToolDispatch toolDispatch = new ToolDispatch();
+        toolDispatch.register(new ShellTool(workingDirectory));
+        toolDispatch.register(new ReadFileTool(workingDirectory));
+        toolDispatch.register(new WriteFileTool(workingDirectory));
+        toolDispatch.register(new EditFileTool(workingDirectory));
+        toolDispatch.register(new GlobTool(workingDirectory));
+        toolDispatch.register(new TodoWrite()); 
+        return toolDispatch;
+    }
+
+    /**
+     * s04 的 hook 装配：创建注册表并按 agent 周期
+     * （输入 → 执行前 → 执行后 → 退出）注册全部 hook。
+     * 同一事件内注册顺序即执行顺序：
+     * 权限排在横幅与日志之前——被拒绝的调用什么都不打。
+     */
+    private static HookRunner initHooks(
+            PermissionChecker permissionChecker,
+            Path workingDirectory
+    ) {
         HookRunner hookRunner = new HookRunner();
 
         // UserPromptSubmit：输入上下文提示（context_inject_hook）。
         hookRunner.registerUserPromptSubmit(
                 query -> System.out.println(
-                        "[HOOK] UserPromptSubmit: working in "
+                        "[HOOK-UserPromptSubmit] UserPromptSubmit: working in "
                                 + workingDirectory
                 )
         );
@@ -154,7 +165,7 @@ public final class Main {
         // PreToolUse 2/3：工具横幅（原 AgentLoop 里的 "> name"）。
         // 注册在权限之后——被拒绝的调用不打横幅。
         hookRunner.registerPreToolUse(toolCall -> {
-            System.out.println("> " + toolCall.name());
+            System.out.println("[HOOK-PreToolUse]> " + toolCall.name());
             return null;
         });
 
@@ -185,13 +196,20 @@ public final class Main {
             return null;
         });
 
-        // PostToolUse 1/2：控制台预览（原 AgentLoop 里的 preview 输出）。
-        // 控制台只预览前 200 字符，完整输出仍回传给模型。
-        hookRunner.registerPostToolUse((toolCall, output) ->
-                System.out.println(preview(output))
-        );
+        // PostToolUse 1/3：控制台全量打印工具输出（调试用），
+        // 完整输出同时回传给模型。
+        hookRunner.registerPostToolUse((toolCall, output) -> {
+            // s05：todo_write 有专门的展示块，不重复打印。
+            if ("todo_write".equals(toolCall.name())) {
+                return;
+            }
 
-        // PostToolUse 2/2：大输出警告（large_output_hook）。
+            System.out.println("[HOOK-PostToolUse]本地工具调用返回结果（to LLM）————————");
+            System.out.println(output);
+            System.out.println("END———————————————————————————————————");
+        });
+
+        // PostToolUse 2/3：大输出警告（large_output_hook）。
         // ShellTool 输出上限 5 万字符，实际由 read_file 等触发。
         hookRunner.registerPostToolUse((toolCall, output) -> {
             if (output != null && output.length() > 100_000) {
@@ -202,6 +220,24 @@ public final class Main {
                                 + " chars"
                 );
             }
+        });
+
+        // PostToolUse 3/3（s05）：todo_write 的控制台展示——
+        // 参考实现在工具里 print 黄色 "## Current Tasks"，
+        // 按 UI-free 原则搬到 hook 层。
+        hookRunner.registerPostToolUse((toolCall, output) -> {
+            if (!"todo_write".equals(toolCall.name())) {
+                return;
+            }
+
+            // 参考实现校验失败时直接返回，不打展示块。
+            if (output == null || output.startsWith("Error:")) {
+                return;
+            }
+
+            System.out.println();
+            System.out.println("\u001B[33m## Current Tasks\u001B[0m");
+            System.out.println(output);
         });
 
         // Stop：会话统计（summary_hook）——
@@ -230,13 +266,7 @@ public final class Main {
             return null;
         });
 
-        AgentLoop agentLoop = new AgentLoop(
-                modelClient,
-                hookRunner,
-                toolDispatch
-        );
-
-        runRepl(agentLoop, hookRunner, workingDirectory, reader);
+        return hookRunner;
     }
 
     /**
@@ -248,7 +278,7 @@ public final class Main {
             Path workingDirectory,
             BufferedReader reader
     ) {
-        System.out.println("OpenDoggo s1: Agent Loop");
+        System.out.println("OpenDoggo v2: Agent Loop & Hook");
         System.out.println("cwd: " + workingDirectory);
         System.out.println(
                 "Enter a question, press Enter to send. "
@@ -322,16 +352,5 @@ public final class Main {
 
     private static boolean isBlank(String value) {
         return value == null || value.isBlank();
-    }
-
-    /**
-     * 控制台只预览前 200 字符，完整输出仍回传给模型。
-     */
-    private static String preview(String output) {
-        if (output.length() <= 200) {
-            return output;
-        }
-
-        return output.substring(0, 200);
     }
 }
