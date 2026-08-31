@@ -39,10 +39,47 @@ public final class AgentLoop {
     private final HookRunner hookRunner;
     private final ToolDispatch toolDispatch;
 
+    // s06：可参数化的轮次上限与超限行为——
+    // 父循环用默认值（50 轮、超限抛异常），
+    // 子循环传 30 轮 + 哨兵字符串（R5）。
+    private final int maxToolRounds;
+    private final String overrunResult;
+
+    // s06：子循环关闭 todo 催更——
+    // 子代理没有 todo_write，提醒只会误导。
+    private final boolean todoReminderEnabled;
+
     public AgentLoop(
             ModelClient modelClient,
             HookRunner hookRunner,
             ToolDispatch toolDispatch
+    ) {
+        this(
+                modelClient,
+                hookRunner,
+                toolDispatch,
+                MAX_TOOL_ROUNDS,
+                null,
+                true
+        );
+    }
+
+    /**
+     * s06 完整构造器。
+     *
+     * maxToolRounds 覆盖默认的 50 轮上限；
+     * overrunResult 非 null 时超限不抛
+     * IllegalStateException、直接返回该字符串
+     * （子代理的哨兵结论）；todoReminderEnabled
+     * 为 false 时关闭 todo 催更提醒。
+     */
+    public AgentLoop(
+            ModelClient modelClient,
+            HookRunner hookRunner,
+            ToolDispatch toolDispatch,
+            int maxToolRounds,
+            String overrunResult,
+            boolean todoReminderEnabled
     ) {
         this.modelClient = Objects.requireNonNull(
                 modelClient,
@@ -59,6 +96,9 @@ public final class AgentLoop {
                 "toolDispatch cannot be null"
         );
 
+        this.maxToolRounds = maxToolRounds;
+        this.overrunResult = overrunResult;
+        this.todoReminderEnabled = todoReminderEnabled;
     }
 
     /**
@@ -76,7 +116,7 @@ public final class AgentLoop {
 
         int roundsSinceTodo = 0;
         for (int round = 0;
-             round < MAX_TOOL_ROUNDS;
+             round < maxToolRounds;
              round++) {
 
             // 将当前完整历史发送给模型。
@@ -158,7 +198,9 @@ public final class AgentLoop {
             roundsSinceTodo = usedTodo ? 0 : roundsSinceTodo + 1;
 
             String reminder = null;
-            if (roundsSinceTodo >= TODO_REMINDER_THRESHOLD) {
+            if (todoReminderEnabled
+                    && roundsSinceTodo
+                            >= TODO_REMINDER_THRESHOLD) {
                 reminder = TODO_REMINDER;
                 roundsSinceTodo = 0;
             }
@@ -166,9 +208,17 @@ public final class AgentLoop {
             messages.add(Message.toolResults(results, reminder));
         }
 
+        // s06：overrunResult 非 null 时（子循环）
+        // 超限不抛异常，哨兵字符串作为本轮结论返回
+        // ——是一次正常的 tool_result，不是崩溃；
+        // 为 null 时（父循环）保持原行为。
+        if (overrunResult != null) {
+            return overrunResult;
+        }
+
         throw new IllegalStateException(
                 "Agent exceeded "
-                        + MAX_TOOL_ROUNDS
+                        + maxToolRounds
                         + " tool rounds"
         );
     }

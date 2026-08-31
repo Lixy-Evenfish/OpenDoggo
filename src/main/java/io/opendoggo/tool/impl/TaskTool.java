@@ -24,6 +24,11 @@ import java.util.Objects;
  */
 public final class TaskTool implements ToolHandler {
 
+     
+    public static final String STOPPED_MESSAGE =
+            "Subagent stopped after 30 turns "
+                    + "without a final answer.";
+                    
     private final AgentLoop subAgentLoop;
 
     public TaskTool(AgentLoop subAgentLoop) {
@@ -64,9 +69,7 @@ public final class TaskTool implements ToolHandler {
         } catch (IOException | RuntimeException exception) {
             // ToolHandler.execute 不抛受检异常；
             // 子循环的失败对父循环只是一次失败的工具调用。
-            // 轮次超限目前沿用 AgentLoop 的 50 轮
-            // IllegalStateException 并在此转为 Error 字符串，
-            // R5 会把它精确成 30 轮 + 哨兵字符串。
+            
             return "Error: " + exception.getMessage();
         }
     }

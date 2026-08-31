@@ -41,6 +41,9 @@ public final class Main {
     private static final Set<String> EXIT_COMMANDS =
             Set.of("q", "exit", "");
 
+    // s06 R5：子代理轮次上限（参考实现 range(30)）。
+    private static final int SUB_MAX_TOOL_ROUNDS = 30;
+
     private Main() {
     }
 
@@ -70,7 +73,8 @@ public final class Main {
 
         // 与 s2 的 SYSTEM 一致，把工作目录写进提示词；
         // s03 增加破坏性操作需审批的声明；
-        // s05 增加先计划再执行的引导。
+        // s05 增加先计划再执行的引导
+        // s06 增加 subagent 委派引导。
         String systemPrompt =
                 "You are a coding agent at "
                         + workingDirectory
@@ -82,11 +86,13 @@ public final class Main {
                         + "todo_write to plan your "
                         + "steps. Update status as "
                         + "you go. "
+                        + "Use task for focused "
+                        + "exploration or a "
+                        + "self-contained subtask. "
                         + "All destructive operations "
                         + "require user approval.";
-
-        // s06：reader 与 hookRunner 必须先于工具装配——
-        // task 工具的子循环要复用同一个 hookRunner。
+        // s06：reader 与权限先于工具装配——
+        // 父/子两个 hookRunner 都依赖 permissionChecker。
         BufferedReader reader = new BufferedReader(
                 new InputStreamReader(
                         System.in,
@@ -105,7 +111,7 @@ public final class Main {
                 permissionChecker,
                 workingDirectory
         );
-
+        HookRunner subHookRunner = initSubHooks(permissionChecker);
         // s06：子代理提示词——只要求完成子任务并返回结论。
         String subSystemPrompt =
                 "You are a coding agent at "
@@ -130,12 +136,18 @@ public final class Main {
                 subDispatch.toolDefinitions()
         );
 
-        // 复用同一个 hookRunner：子代理的工具调用
-        // 走与父代理相同的权限门（委派不降级权限）。
+        // s06 R5：子循环 30 轮上限，超限不抛异常、
+        // 返回哨兵结论（TaskTool.STOPPED_MESSAGE）；
+        // 关闭 todo 催更（子代理没有 todo_write）。
+        // 权限走 subHookRunner——它与父循环共用
+        // 同一个 PermissionChecker 实例（不降级）。
         AgentLoop subAgentLoop = new AgentLoop(
                 subClient,
-                hookRunner,
-                subDispatch
+                subHookRunner,
+                subDispatch,
+                SUB_MAX_TOOL_ROUNDS,
+                TaskTool.STOPPED_MESSAGE,
+                false
         );
 
         // task 是父循环的第七个工具，
@@ -193,6 +205,72 @@ public final class Main {
         toolDispatch.register(new TodoWrite());
         toolDispatch.register(taskTool);
         return toolDispatch;
+    }
+
+
+    /**
+     * s06 R9：子代理的 hook 装配。
+     *
+     * 权限与父循环共用同一个 PermissionChecker 实例
+     * （委派不降级权限，Gate 3 审批照常弹出）；
+     * 展示换成精简的 [sub] 前缀：输出预览 100 字符 +
+     * 子会话统计，不重复父循环的横幅/日志/全量输出。
+     */
+    private static HookRunner initSubHooks(
+            PermissionChecker permissionChecker
+    ) {
+        HookRunner hookRunner = new HookRunner();
+
+        // PreToolUse：三道闸门——与父循环同一实例。
+        hookRunner.registerPreToolUse(
+                permissionChecker::check
+        );
+
+        // PostToolUse：[sub] 预览——
+        // 工具名 + 输出前 100 字符，灰色缩进两格。
+        hookRunner.registerPostToolUse((toolCall, output) -> {
+            String preview = String.valueOf(output);
+
+            if (preview.length() > 100) {
+                preview = preview.substring(0, 100);
+            }
+
+            System.out.println(
+                    "  \u001B[90m[sub] "
+                            + toolCall.name()
+                            + ": " + preview
+                            + "\u001B[0m"
+            );
+        });
+
+        // Stop：子会话统计——参考实现同样会在子消息
+        // 列表上触发 Stop summary。
+        hookRunner.registerStop(messages -> {
+            long toolCount = 0;
+
+            for (Message message : messages) {
+                JsonNode content = message.content();
+
+                if (content != null && content.isArray()) {
+                    for (JsonNode block : content) {
+                        if ("tool_result".equals(
+                                block.path("type").asText()
+                        )) {
+                            toolCount++;
+                        }
+                    }
+                }
+            }
+
+            System.out.println(
+                    "  \u001B[90m[sub] Stop: used "
+                            + toolCount
+                            + " tool calls\u001B[0m"
+            );
+            return null;
+        });
+
+        return hookRunner;
     }
 
     /**
@@ -254,7 +332,7 @@ public final class Main {
             return null;
         });
 
-        // PostToolUse 1/3：控制台全量打印工具输出（调试用），
+        // PostToolUse 1/4：控制台全量打印工具输出（调试用），
         // 完整输出同时回传给模型。
         hookRunner.registerPostToolUse((toolCall, output) -> {
             // s05：todo_write 有专门的展示块，不重复打印。
@@ -267,7 +345,7 @@ public final class Main {
             System.out.println("END———————————————————————————————————");
         });
 
-        // PostToolUse 2/3：大输出警告（large_output_hook）。
+        // PostToolUse 2/4：大输出警告（large_output_hook）。
         // ShellTool 输出上限 5 万字符，实际由 read_file 等触发。
         hookRunner.registerPostToolUse((toolCall, output) -> {
             if (output != null && output.length() > 100_000) {
@@ -280,7 +358,7 @@ public final class Main {
             }
         });
 
-        // PostToolUse 3/3（s05）：todo_write 的控制台展示——
+        // PostToolUse 3/4（s05）：todo_write 的控制台展示——
         // 参考实现在工具里 print 黄色 "## Current Tasks"，
         // 按 UI-free 原则搬到 hook 层。
         hookRunner.registerPostToolUse((toolCall, output) -> {
@@ -296,6 +374,34 @@ public final class Main {
             System.out.println();
             System.out.println("\u001B[33m## Current Tasks\u001B[0m");
             System.out.println(output);
+        });
+
+        // PostToolUse 4/4（s06）：task 结束标记——
+        // 输出等于哨兵字符串即超限停止，否则正常结束。
+        hookRunner.registerPostToolUse((toolCall, output) -> {
+            if (!"task".equals(toolCall.name())) {
+                return;
+            }
+
+            String marker =
+                    TaskTool.STOPPED_MESSAGE.equals(output)
+                            ? "[Subagent stopped]"
+                            : "[Subagent done]";
+
+            System.out.println(
+                    "\u001B[35m" + marker + "\u001B[0m"
+            );
+        });
+
+        // PreToolUse 4/4（s06）：task 起跑标记——
+        // 注册在权限/横幅/日志之后，被拒绝的 task 不打。
+        hookRunner.registerPreToolUse(toolCall -> {
+            if ("task".equals(toolCall.name())) {
+                System.out.println(
+                        "\u001B[35m[Subagent started]\u001B[0m"
+                );
+            }
+            return null;
         });
 
         // Stop：会话统计（summary_hook）——
