@@ -8,10 +8,12 @@ import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.impl.AnthropicClient;
 import io.opendoggo.permission.ConsoleApprovalPrompt;
 import io.opendoggo.permission.PermissionChecker;
+import io.opendoggo.skill.SkillLoader;
 import io.opendoggo.tool.ToolDispatch;
 import io.opendoggo.tool.ToolHandler;
 import io.opendoggo.tool.impl.EditFileTool;
 import io.opendoggo.tool.impl.GlobTool;
+import io.opendoggo.tool.impl.LoadSkillTool;
 import io.opendoggo.tool.impl.ReadFileTool;
 import io.opendoggo.tool.impl.ShellTool;
 import io.opendoggo.tool.impl.TaskTool;
@@ -75,22 +77,42 @@ public final class Main {
         // s03 增加破坏性操作需审批的声明；
         // s05 增加先计划再执行的引导
         // s06 增加 subagent 委派引导。
-        String systemPrompt =
+        // s07：技能目录（名称+描述）进 system prompt，
+        // 完整 SKILL.md 留给 load_skill 按需加载。
+        SkillLoader skillLoader = new SkillLoader(
+                workingDirectory.resolve("skills"));
+
+        String identity =
                 "You are a coding agent at "
                         + workingDirectory
                         + ". Use the available tools "
                         + "to solve tasks. "
-                        + "Act, don't explain. "
-                        + "Before starting any "
+                        + "Act, don't explain.";
+        String planning =
+                "Before starting any "
                         + "multi-step task, use "
                         + "todo_write to plan your "
                         + "steps. Update status as "
-                        + "you go. "
-                        + "Use task for focused "
+                        + "you go.";
+        String delegation =
+                "Use task for focused "
                         + "exploration or a "
-                        + "self-contained subtask. "
-                        + "All destructive operations "
+                        + "self-contained subtask.";
+        String approval =
+                "All destructive operations "
                         + "require user approval.";
+        String skills =
+                "Skills available:\n"
+                        + skillLoader.catalog()
+                        + "\n\nUse load_skill to read "
+                        + "the full instructions "
+                        + "when a skill applies.";
+
+        String systemPrompt = identity
+                + " " + planning
+                + " " + delegation
+                + " " + approval
+                + "\n\n" + skills;
         // s06：reader 与权限先于工具装配——
         // 父/子两个 hookRunner 都依赖 permissionChecker。
         BufferedReader reader = new BufferedReader(
@@ -151,10 +173,12 @@ public final class Main {
         );
 
         // task 是父循环的第七个工具，
-        // 内部同步驱动上面的子循环。
+        // 内部同步驱动上面的子循环；
+        // load_skill 是第八个，查询 SkillLoader 注册表。
         ToolDispatch toolDispatch = initTools(
                 workingDirectory,
-                new TaskTool(subAgentLoop)
+                new TaskTool(subAgentLoop),
+                skillLoader
         );
         ArrayNode toolDefinitions = toolDispatch.toolDefinitions();
         ModelClient modelClient = new AnthropicClient(
@@ -192,18 +216,22 @@ public final class Main {
 
     /**
      * 父循环工具装配：基础五工具 + todo_write
-     * + s06 的 task（第七个工具）。
+     * + s06 的 task（第七个工具）
+     * + s07 的 load_skill（第八个工具，仅父循环——
+     * 子分发表保持严格五基础工具口径）。
      * 新增工具 = 实现 ToolHandler 后在这里登记一行，
      * tools 数组由注册表自动生成。
      */
     private static ToolDispatch initTools(
             Path workingDirectory,
-            ToolHandler taskTool
+            ToolHandler taskTool,
+            SkillLoader skillLoader
     ) {
         ToolDispatch toolDispatch =
                 initBaseTools(workingDirectory);
         toolDispatch.register(new TodoWrite());
         toolDispatch.register(taskTool);
+        toolDispatch.register(new LoadSkillTool(skillLoader));
         return toolDispatch;
     }
 

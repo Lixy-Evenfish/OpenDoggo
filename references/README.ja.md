@@ -1,90 +1,118 @@
-# s06: Subagent — サブタスクに独立したコンテキストを与える
+# s07: Skill Loading — 必要なときにスキルを読み込む
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-s01 → s02 → s03 → s04 → s05 → `s06` → [s07](../s07_skill_loading/) → s08 → ... → s16 → s17
+s01 → s02 → s03 → s04 → s05 → s06 → `s07` → [s08](../s08_context_compact/) → s09 → ... → s16 → s17
 
-> Subagent は新しい `messages[]` から始まる。最終テキストだけが親ループへ戻り、中間会話は親コンテキストへ入らない。
+> system prompt にはスキルカタログを入れ、`load_skill` は完全な `SKILL.md` を返す。
 >
-> **Harness レイヤー**: 委任 — 明確なサブタスクを別の会話コンテキストで処理する。
+> **Harness レイヤー**：知識の読み込み — 利用可能なスキルをモデルに示し、名前で内容を読み込む。
 
 ---
 
 ## 課題
 
-Agent がバグを修正している。呼び出しチェーンを追うために多くのファイルを読み、すべてのツール呼び出しと結果が親の `messages[]` に残る。チェーンを把握した後は不要になる中間情報も、コンテキストを使い続ける。
+あるプロジェクトに React コンポーネント仕様、SQL スタイルガイド、API 設計ドキュメントがあるとする。開発中に Agent へこれらの規約を守らせたい場合、最も直接的な方法は、すべてを system prompt に入れることだ：
+
+```python
+SYSTEM = (
+    f"You are a coding agent. "
+    + open("docs/react-style.md").read()
+    + open("docs/sql-style.md").read()
+    + open("docs/api-design.md").read()
+)
+```
+
+この方法で Agent はすべての規約を読めるが、3 つの文書すべてが system prompt に固定され、現在のタスクに必要な文書だけを選べない。LLM を呼び出すたびに、3 つの文書の全文がモデルへ送られる。タスクが React コンポーネントの変更だけなら、必要なのは React コンポーネント仕様だけである。無関係な SQL スタイルガイドと API 設計ドキュメントも入力 token とコンテキストウィンドウを使うため、コード、会話、tool result に使える領域が減る。
 
 ---
 
 ## ソリューション
 
-![Subagent Overview](images/subagent-overview.ja.svg)
+![Skill Overview](images/skill-overview.ja.svg)
 
-`task` を呼ぶと、新しい `messages[]` を使う入れ子の Agent Loop が同期実行される。ループが終了すると、最終テキストが親会話の tool result になる。
+起動時に `SkillLoader` が `skills/*/SKILL.md` を走査し、YAML frontmatter の `name` と `description` を読み取って、カタログを system prompt に追加する。完全な指示が必要になると、モデルは `load_skill(name)` を呼ぶ。返された `SKILL.md` は `tool_result` としてメッセージリストへ追加される。
 
-ここで分離するのはメッセージであり、プロセスやファイルシステムではない。親 Agent とサブエージェントは `WORKDIR` を共有するため、書き込みやコマンドは同じワークスペースへ作用する。サブエージェントは 5 つの基本ツールを持つが `task` はなく、親と同じ権限 Hooks とライフサイクル Hooks を使う。
+| 内容 | モデル入力での位置 | 追加時点 |
+|------|--------------------|----------|
+| スキル名と説明 | system prompt | 起動時 |
+| 完全な `SKILL.md` | `tool_result` | `load_skill` 呼び出し時 |
 
 ---
 
 ## 仕組み
 
-**run_subagent** は新しいメッセージリストを作り、入れ子のループを実行して、最終テキストを返す：
+各スキルは `SKILL.md` を持つディレクトリである：
 
-```python
-SUB_TOOLS = list(BASE_TOOLS)  # no task tool
-
-def run_subagent(prompt: str) -> str:
-    messages = [{"role": "user", "content": prompt}]
-
-    for _ in range(30):
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        tool_calls = [
-            block for block in response.content if block.type == "tool_use"
-        ]
-        if not tool_calls:
-            return extract_text(response.content) or "(no summary)"
-
-        results = []
-        for block in tool_calls:
-            output = execute_tool(block, SUB_HANDLERS)
-            results.append({... "content": output})
-        messages.append({"role": "user", "content": results})
-
-    return "Subagent stopped after 30 turns without a final answer."
+```text
+skills/
+  agent-builder/SKILL.md
+  code-review/SKILL.md
+  mcp-builder/SKILL.md
+  pdf/SKILL.md
 ```
 
-メイン Agent の呼び出しは、他のツールと同じ：
+### スキルを走査する
 
 ```python
-TASK_TOOL = {
-    "name": "task",
-    "description": "Run a subagent with fresh conversation context and return its final text.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"prompt": {"type": "string"}},
-        "required": ["prompt"],
-    },
-}
-
-TOOLS = [*BASE_TOOLS, TASK_TOOL]
-TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
+class SkillLoader:
+    def scan(self):
+        self.skills.clear()
+        skills_root = self.skills_dir.resolve()
+        for manifest in sorted(self.skills_dir.glob("*/SKILL.md")):
+            if (not manifest.is_file()
+                    or not manifest.resolve().is_relative_to(skills_root)):
+                continue
+            content = manifest.read_text(encoding="utf-8")
+            metadata, body = self.parse_frontmatter(content)
+            raw_name = metadata.get("name")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            name = name or manifest.parent.name
+            raw_description = metadata.get("description")
+            description = (raw_description.strip()
+                           if isinstance(raw_description, str) else "")
+            description = description or body.split("\n", 1)[0]
+            description = " ".join(str(description).lstrip("# ").split())
+            self.skills[name] = {
+                "name": name,
+                "description": description,
+                "content": content,
+            }
 ```
 
-実際の境界は次のとおり：
+`catalog()` は名前と説明だけを返す：
 
-| 決定 | 選択 | 理由 |
-|------|------|------|
-| 会話 | 新しい `messages[]` | 親の会話をサブエージェントへコピーしない |
-| 実行 | 同じプロセスと `WORKDIR` | どちらのループからもファイル変更が見える |
-| 戻り値 | 最終テキストのみ | 子のツール呼び出しと結果を親 messages へコピーしない |
-| 委任の深さ | `SUB_TOOLS` に `task` なし | 本章では 1 階層の委任だけを許可 |
-| ツールポリシー | Hooks を共有 | 親子で同じ権限チェックを使う |
+```text
+- code-review: Perform thorough code reviews...
+- pdf: Process PDF files...
+```
 
-親 Agent は他のツールと同じ handler map から `task` を実行する。サブエージェントは `SUB_SYSTEM`、`SUB_TOOLS`、ローカルな `messages` リストを使う。
+### system prompt を組み立てる
+
+```python
+def build_system_prompt() -> str:
+    return (
+        f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
+        "Act, don't explain.\n\n"
+        f"Skills available:\n{SKILL_LOADER.catalog()}\n\n"
+        "Use load_skill to read the full instructions when a skill applies."
+    )
+```
+
+固定された Agent の指示と、起動時に見つかったスキルカタログをこの関数で組み合わせる。
+
+### 完全な内容を読み込む
+
+```python
+def load(self, name: str) -> str:
+    skill = self.skills.get(name)
+    if skill:
+        return skill["content"]
+    available = ", ".join(self.skills) or "none"
+    return f"Error: Unknown skill '{name}'. Available: {available}"
+```
+
+`name` は起動時に作られたレジストリの検索に使われ、ファイルパスとして解釈されない。ツールが返ると、既存の Agent Loop が内容を新しい `tool_result` メッセージとして追加する。
 
 ---
 
@@ -92,24 +120,24 @@ TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 
 ```sh
 cd learn-claude-code
-python s06_subagent/code.py
+python s07_skill_loading/code.py
 ```
 
-以下のプロンプトを試してみよう：
+以下の prompt を試す：
 
-1. `Use a subtask to find what testing framework this project uses`（サブエージェントがファイルを読み、メイン Agent は結論のみ受け取る）
-2. `Delegate: read all .py files in agents/ and summarize what each one does`
-3. `Use a task to create s06_subagent/example/string_tools.py with a slugify(text: str) function, then verify it from the parent agent`
+1. `What skills are available?`
+2. `Load the code-review skill and follow its instructions`
+3. `Review README.md and load the relevant skill first`
 
-観察のポイント：`[Subagent started]` / `[Subagent done]` が表示されるか？ サブエージェントのツール呼び出しが `[sub] ...` と表示されるか？ 親 Agent は `task` が返した最終テキストだけを受け取るか？
+system prompt にカタログだけが入り、`load_skill` の呼び出し後に完全な `SKILL.md` が現れることを確認する。
 
 ---
 
 ## 次へ
 
-Agent はタスクを分割できるようになった。しかし各タスクに必要な知識は異なる。フロントエンドコンポーネントの変更には React 規約が必要で、SQL を書くにはテーブル構造を知る必要がある。これらの知識をすべて system prompt に詰め込むと、コンテキストが溢れてしまう。
+ツール呼び出しが増えると、`messages[]` には以前のファイル内容やツール結果が残る。
 
-→ s07 Skill Loading：スキルをオンデマンドで注入する。system prompt にドキュメントを積み上げるのではなく、必要なときだけ読み込む。ファイルを読むのと同じくらい自然に。
+s08 Context Compact → 過去のメッセージを短くし、後続の呼び出しで使えるコンテキストを確保する。
 
 
-<!-- translation-sync: zh@v2, en@v2, ja@v2 -->
+<!-- translation-sync: zh@v6, en@v6, ja@v6 -->

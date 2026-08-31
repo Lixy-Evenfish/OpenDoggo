@@ -1,90 +1,118 @@
-# s06: Subagent — Give a Subtask Its Own Context
+# s07: Skill Loading — Load Skills When Needed
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-s01 → s02 → s03 → s04 → s05 → `s06` → [s07](../s07_skill_loading/) → s08 → ... → s16 → s17
+s01 → s02 → s03 → s04 → s05 → s06 → `s07` → [s08](../s08_context_compact/) → s09 → ... → s16 → s17
 
-> A subagent starts with a fresh `messages[]`. Its final text returns to the parent; its intermediate conversation does not.
+> The system prompt contains the skill catalog; `load_skill` returns the full `SKILL.md`.
 >
-> **Harness Layer**: Delegation — Run a focused task in a separate conversation context.
+> **Harness Layer**: Knowledge loading — show the model which skills exist, then load one by name.
 
 ---
 
 ## The Problem
 
-The Agent is fixing a bug. It reads many files to trace the call chain, and every tool call and result stays in the parent's `messages[]`. Once the call chain is understood, most of those intermediate details are no longer needed, but they still occupy context.
+Suppose a project has a React component specification, a SQL style guide, and an API design document. We want the Agent to follow these rules during development, so the most direct approach is to put all of them into the system prompt:
+
+```python
+SYSTEM = (
+    f"You are a coding agent. "
+    + open("docs/react-style.md").read()
+    + open("docs/sql-style.md").read()
+    + open("docs/api-design.md").read()
+)
+```
+
+This approach lets the Agent read every specification, but it fixes all three documents in the system prompt instead of selecting only the one needed for the current task. Every LLM call sends the full text of all three documents to the model. When the task only changes React components, only the React specification is relevant; the SQL style guide and API design document still consume input tokens and context-window space that could hold code, conversation, and tool results.
 
 ---
 
 ## The Solution
 
-![Subagent Overview](images/subagent-overview.en.svg)
+![Skill Overview](images/skill-overview.en.svg)
 
-Calling `task` synchronously runs a nested agent loop with a fresh `messages[]`. When that loop finishes, its final text becomes the tool result in the parent conversation.
+At startup, `SkillLoader` scans `skills/*/SKILL.md`, reads `name` and `description` from YAML frontmatter, and adds that catalog to the system prompt. When the model needs the full instructions, it calls `load_skill(name)`; the returned `SKILL.md` is appended to the message list as a `tool_result`.
 
-This is message isolation, not process or filesystem isolation. Parent and subagent run in the same Python process and share `WORKDIR`, so writes and commands still affect the same workspace. The subagent has the five base tools but no `task`, and its tool calls use the same permission and lifecycle hooks as the parent.
+| Content | Model input | Added |
+|---------|-------------|-------|
+| Skill name and description | system prompt | At startup |
+| Full `SKILL.md` | `tool_result` | When `load_skill` is called |
 
 ---
 
 ## How It Works
 
-**run_subagent** creates the fresh message list, runs the nested loop, and returns the final text:
+Each skill is a directory containing `SKILL.md`:
 
-```python
-SUB_TOOLS = list(BASE_TOOLS)  # no task tool
-
-def run_subagent(prompt: str) -> str:
-    messages = [{"role": "user", "content": prompt}]
-
-    for _ in range(30):
-        response = client.messages.create(
-            model=MODEL, system=SUB_SYSTEM,
-            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-        tool_calls = [
-            block for block in response.content if block.type == "tool_use"
-        ]
-        if not tool_calls:
-            return extract_text(response.content) or "(no summary)"
-
-        results = []
-        for block in tool_calls:
-            output = execute_tool(block, SUB_HANDLERS)
-            results.append({... "content": output})
-        messages.append({"role": "user", "content": results})
-
-    return "Subagent stopped after 30 turns without a final answer."
+```text
+skills/
+  agent-builder/SKILL.md
+  code-review/SKILL.md
+  mcp-builder/SKILL.md
+  pdf/SKILL.md
 ```
 
-The main Agent calls it just like any other tool:
+### Scan Skills
 
 ```python
-TASK_TOOL = {
-    "name": "task",
-    "description": "Run a subagent with fresh conversation context and return its final text.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"prompt": {"type": "string"}},
-        "required": ["prompt"],
-    },
-}
-
-TOOLS = [*BASE_TOOLS, TASK_TOOL]
-TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
+class SkillLoader:
+    def scan(self):
+        self.skills.clear()
+        skills_root = self.skills_dir.resolve()
+        for manifest in sorted(self.skills_dir.glob("*/SKILL.md")):
+            if (not manifest.is_file()
+                    or not manifest.resolve().is_relative_to(skills_root)):
+                continue
+            content = manifest.read_text(encoding="utf-8")
+            metadata, body = self.parse_frontmatter(content)
+            raw_name = metadata.get("name")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            name = name or manifest.parent.name
+            raw_description = metadata.get("description")
+            description = (raw_description.strip()
+                           if isinstance(raw_description, str) else "")
+            description = description or body.split("\n", 1)[0]
+            description = " ".join(str(description).lstrip("# ").split())
+            self.skills[name] = {
+                "name": name,
+                "description": description,
+                "content": content,
+            }
 ```
 
-The boundary is:
+`catalog()` returns only names and descriptions:
 
-| Decision | Choice | Reason |
-|----------|--------|--------|
-| Conversation | Fresh `messages[]` | Parent history is not copied into the subagent |
-| Execution | Same process and `WORKDIR` | Filesystem changes remain visible to both loops |
-| Return value | Final text only | Child tool calls and results are not copied into parent messages |
-| Delegation depth | No `task` in `SUB_TOOLS` | This lesson permits one delegation level |
-| Tool policy | Shared Hooks | Parent and subagent use the same permission checks |
+```text
+- code-review: Perform thorough code reviews...
+- pdf: Process PDF files...
+```
 
-The parent dispatches `task` through the same handler map as its other tools. The subagent uses `SUB_SYSTEM`, `SUB_TOOLS`, and its own local `messages` list.
+### Build the System Prompt
+
+```python
+def build_system_prompt() -> str:
+    return (
+        f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
+        "Act, don't explain.\n\n"
+        f"Skills available:\n{SKILL_LOADER.catalog()}\n\n"
+        "Use load_skill to read the full instructions when a skill applies."
+    )
+```
+
+This function combines the fixed Agent instructions with the catalog found at startup.
+
+### Load Full Content
+
+```python
+def load(self, name: str) -> str:
+    skill = self.skills.get(name)
+    if skill:
+        return skill["content"]
+    available = ", ".join(self.skills) or "none"
+    return f"Error: Unknown skill '{name}'. Available: {available}"
+```
+
+`name` looks up the startup registry; it is not interpreted as a file path. After the tool returns, the existing Agent Loop appends its content as a new `tool_result` message.
 
 ---
 
@@ -92,24 +120,24 @@ The parent dispatches `task` through the same handler map as its other tools. Th
 
 ```sh
 cd learn-claude-code
-python s06_subagent/code.py
+python s07_skill_loading/code.py
 ```
 
 Try these prompts:
 
-1. `Use a subtask to find what testing framework this project uses` (sub-Agent reads files, main Agent receives only the conclusion)
-2. `Delegate: read all .py files in agents/ and summarize what each one does`
-3. `Use a task to create s06_subagent/example/string_tools.py with a slugify(text: str) function, then verify it from the parent agent`
+1. `What skills are available?`
+2. `Load the code-review skill and follow its instructions`
+3. `Review README.md and load the relevant skill first`
 
-What to watch for: Do `[Subagent started]` / `[Subagent done]` appear? Do subagent tool calls print as `[sub] ...`? Does the parent continue with only the final text returned by `task`?
+Check that the system prompt contains only the catalog and that the full `SKILL.md` appears after `load_skill` is called.
 
 ---
 
 ## What's Next
 
-The Agent can now break tasks apart. But different tasks require different knowledge: editing frontend components needs React conventions, writing SQL needs table schemas. Stuffing all this knowledge into the system prompt would blow up the context.
+As tool calls accumulate, `messages[]` retains earlier file contents and tool results.
 
-→ s07 Skill Loading: Inject skills on demand instead of piling documents into the system prompt. Load only when needed, as natural as reading a file.
+→ s08 Context Compact: shorten earlier messages and keep context available for later calls.
 
 
-<!-- translation-sync: zh@v2, en@v2, ja@v2 -->
+<!-- translation-sync: zh@v6, en@v6, ja@v6 -->

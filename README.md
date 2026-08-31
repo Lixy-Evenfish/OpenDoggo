@@ -28,7 +28,7 @@ v2 的主线是让 agent loop 成为稳定内核,并扩展其他刚需功能：�
 - **Hooks** — Agent loop 引入 hook 与 trigger 机制，在 4 个关键位置（`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`）设置挂载点，`AgentLoop` 的代码就此固定，后续扩展只需在 `Main` 注册 hook（权限、横幅、预览已挂上，示例 hook 补全中）
 - **TodoWrite**— 计划工具，让 agent 显式维护任务清单
 - **SubAgent**— 子 agent，允主agent通过调用工具的方法，把独立子任务委派出去
-- **Skill**（尚未完成）— 技能加载机制
+- **Skill** — 按需知识加载：启动时扫描 `skills/` 把技能目录（名称+描述）写进 system prompt，模型判断相关时经 `load_skill` 工具取回完整 `SKILL.md`（详见下文[技能](#技能)一节）
 
 ## 环境要求
 
@@ -113,6 +113,55 @@ java -jar target/opendoggo-0.1.0-SNAPSHOT.jar
 ### 路径解析
 
 `read_file` / `write_file` / `edit_file` 的路径统一经 `WorkspacePaths` 解析：相对工作区归一化，空路径报错（`Error: path cannot be empty`）。s02 曾在工具内直接拒绝逸出工作区的路径；s03 起该条件上移为权限规则（闸门 2），用户批准后可访问工作区外路径。
+
+## 技能
+
+技能（skill）是一份按需加载的知识包：一个目录 + 一个 `SKILL.md`。启动时 `SkillLoader`（`io.opendoggo.skill`）扫描 `skills/` 下**恰好一层深**的 `SKILL.md`，把每项的**名称和描述**做成目录写进 system prompt；模型判断某项相关时调用 `load_skill` 工具取回**完整原文**，作为 tool_result 进入上下文。目录常驻、正文按需——无关文档不再占用每次调用的输入 token。
+
+### 添加一个技能
+
+```text
+skills/
+  my-skill/SKILL.md        ← 一个技能 = 一级子目录 + 固定文件名 SKILL.md
+```
+
+`SKILL.md` 顶部是可选的 frontmatter（两行 `---` 包住），正文为任意 Markdown：
+
+```markdown
+---
+name: my-skill
+description: 什么时候用这个技能——目录里唯一的触发依据，写"何时用"而非"是什么"
+---
+
+# 完整指令写在这里
+步骤、规则、输出格式……
+```
+
+- frontmatter 缺省时回退：`name` 取目录名，`description` 取正文首行；description 支持多行块标量（`|` 后接缩进续行），进目录时折叠为单行
+- 解析全程容错：格式损坏不报错、走回退；**新增或修改技能后需重启**——技能表是启动时的一次性快照，运行期不刷新
+- `load_skill` 的 `name` 只是注册表键，不当文件路径解析；未命中返回 `Error: Unknown skill '...'. Available: ...`，模型会照列表自行纠正
+
+仓库自带四个课程示例技能：`agent-builder`、`code-review`、`mcp-builder`、`pdf`。`agent-builder` 的 `references/`、`scripts/` 附属文件不参与扫描，但模型加载技能后可用 `read_file` 按 SKILL.md 正文里给出的相对路径读取。
+
+### 在 REPL 里怎么用
+
+不需要任何新命令，正常说话即可（工具不直接暴露给用户，模型自行决定何时加载）：
+
+```text
+doggo >> What skills are available?
+（照 system prompt 里的目录回答，连 load_skill 都不调）
+
+doggo >> Load the code-review skill and follow its instructions
+（显式点名，加载后按技能里的步骤干活）
+
+doggo >> Review README.md and load the relevant skill first
+（隐式触发：模型读目录里的 description 自行选中 code-review）
+```
+
+### 边界
+
+- `load_skill` 只注册在父循环；子代理（`task` 工具派出的）没有它。子任务需要技能知识时，由父代理先加载、把要点提炼进 task 的 prompt 再委派
+- 无权限规则：纯内存注册表查询，无路径穿越面，fail-open（同 `todo_write` / `task`）
 
 ## 权限
 

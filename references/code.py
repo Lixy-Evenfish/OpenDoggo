@@ -1,27 +1,30 @@
 #!/usr/bin/env python3
 """
-s06_subagent.py - Subagents
+s07_skill_loading.py - Skill Loading
 
-The task tool runs a second agent loop with a fresh message list. Both
-loops share the working directory, but only the final text returns to
-the parent conversation.
+The system prompt contains a catalog of skill names and descriptions.
+The model loads the full SKILL.md only when it calls load_skill.
 
-    Parent agent                    Subagent
-    +------------------+            +------------------+
-    | messages=[...]   |            | messages=[prompt]|
-    |                  |   task     |                  |
-    | tool: task       | ---------> | own agent loop   |
-    |                  |            | base tools only  |
-    | tool_result      | <--------- | final text       |
-    +------------------+            +------------------+
+    skills/                    Startup
+    +------------------+       +------------------+
+    | code-review/     | ----> | SkillLoader      |
+    |   SKILL.md       |       | name + summary   |
+    | pdf/             |       +--------+---------+
+    |   SKILL.md       |                |
+    +------------------+                v
+                                 system prompt catalog
 
-The subagent has no task tool, so it cannot delegate again.
+    LLM -- load_skill(name) --> full SKILL.md
+     ^                              |
+     +--------- tool_result --------+
 """
 
 import os
 import re
 import subprocess
 from pathlib import Path
+
+import yaml
 
 try:
     import readline
@@ -40,20 +43,101 @@ if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
 
 WORKDIR = Path.cwd()
+SKILLS_DIR = WORKDIR / "skills"
 client = Anthropic(base_url=os.getenv("ANTHROPIC_BASE_URL"))
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Use task for focused exploration or a self-contained subtask."
-)
-SUB_SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Complete the given task, then return a concise final answer."
-)
+
+# -- Skill catalog --
+
+class SkillLoader:
+    def __init__(self, skills_dir: Path):
+        self.skills_dir = skills_dir
+        self.skills: dict[str, dict[str, str]] = {}
+        self.scan()
+
+    @staticmethod
+    def parse_frontmatter(text: str) -> tuple[dict, str]:
+        lines = text.splitlines(keepends=True)
+        if not lines or lines[0].rstrip("\r\n") != "---":
+            return {}, text
+
+        closing_index = next(
+            (index for index, line in enumerate(lines[1:], start=1)
+             if line.rstrip("\r\n") == "---"),
+            None,
+        )
+        if closing_index is None:
+            return {}, text
+
+        frontmatter = "".join(lines[1:closing_index])
+        body = "".join(lines[closing_index + 1:]).strip()
+        try:
+            metadata = yaml.safe_load(frontmatter) or {}
+        except yaml.YAMLError:
+            metadata = {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        return metadata, body
+
+    def scan(self):
+        self.skills.clear()
+        if not self.skills_dir.exists():
+            return
+
+        skills_root = self.skills_dir.resolve()
+        for manifest in sorted(self.skills_dir.glob("*/SKILL.md")):
+            if (not manifest.is_file()
+                    or not manifest.resolve().is_relative_to(skills_root)):
+                continue
+            content = manifest.read_text(encoding="utf-8")
+            metadata, body = self.parse_frontmatter(content)
+            raw_name = metadata.get("name")
+            name = raw_name.strip() if isinstance(raw_name, str) else ""
+            name = name or manifest.parent.name
+            raw_description = metadata.get("description")
+            description = (raw_description.strip()
+                           if isinstance(raw_description, str) else "")
+            description = description or body.split("\n", 1)[0]
+            description = " ".join(str(description).lstrip("# ").split())
+            self.skills[name] = {
+                "name": name,
+                "description": description,
+                "content": content,
+            }
+
+    def catalog(self) -> str:
+        if not self.skills:
+            return "(no skills found)"
+        return "\n".join(
+            f"- {skill['name']}: {skill['description']}"
+            for skill in self.skills.values()
+        )
+
+    def load(self, name: str) -> str:
+        skill = self.skills.get(name)
+        if skill:
+            return skill["content"]
+        available = ", ".join(self.skills) or "none"
+        return f"Error: Unknown skill '{name}'. Available: {available}"
 
 
-# -- Base tools --
+SKILL_LOADER = SkillLoader(SKILLS_DIR)
+
+
+def build_system_prompt() -> str:
+    return (
+        f"You are a coding agent at {WORKDIR}. Use tools to solve tasks. "
+        "Act, don't explain.\n\n"
+        f"Skills available:\n{SKILL_LOADER.catalog()}\n\n"
+        "Use load_skill to read the full instructions when a skill applies."
+    )
+
+
+SYSTEM = build_system_prompt()
+
+
+# -- Tools --
 
 def run_bash(command: str) -> str:
     try:
@@ -115,7 +199,7 @@ def run_glob(pattern: str) -> str:
         return f"Error: {e}"
 
 
-BASE_TOOLS = [
+TOOLS = [
     {"name": "bash", "description": "Run a shell command.",
      "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
     {"name": "read_file", "description": "Read file contents.",
@@ -126,14 +210,17 @@ BASE_TOOLS = [
      "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
     {"name": "glob", "description": "Find files matching a glob pattern; ** matches recursively.",
      "input_schema": {"type": "object", "properties": {"pattern": {"type": "string"}}, "required": ["pattern"]}},
+    {"name": "load_skill", "description": "Load the full SKILL.md content by skill name.",
+     "input_schema": {"type": "object", "properties": {"name": {"type": "string"}}, "required": ["name"]}},
 ]
 
-BASE_HANDLERS = {
+TOOL_HANDLERS = {
     "bash": run_bash,
     "read_file": run_read,
     "write_file": run_write,
     "edit_file": run_edit,
     "glob": run_glob,
+    "load_skill": SKILL_LOADER.load,
 }
 
 
@@ -236,12 +323,12 @@ register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", summary_hook)
 
 
-def execute_tool(block, handlers: dict) -> str:
+def execute_tool(block) -> str:
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
 
-    handler = handlers.get(block.name)
+    handler = TOOL_HANDLERS.get(block.name)
     try:
         output = handler(**block.input) if handler else f"Unknown: {block.name}"
     except Exception as e:
@@ -250,78 +337,6 @@ def execute_tool(block, handlers: dict) -> str:
     trigger_hooks("PostToolUse", block, output)
     return str(output)
 
-
-# -- New in s06: a nested agent loop with fresh messages --
-
-SUB_TOOLS = list(BASE_TOOLS)
-SUB_HANDLERS = dict(BASE_HANDLERS)
-
-
-def extract_text(content) -> str:
-    if not isinstance(content, list):
-        return str(content)
-    return "\n".join(
-        getattr(block, "text", "")
-        for block in content
-        if getattr(block, "type", None) == "text"
-    )
-
-
-def run_subagent(prompt: str) -> str:
-    print("\n\033[35m[Subagent started]\033[0m")
-    messages = [{"role": "user", "content": prompt}]
-
-    for _ in range(30):
-        response = client.messages.create(
-            model=MODEL,
-            system=SUB_SYSTEM,
-            messages=messages,
-            tools=SUB_TOOLS,
-            max_tokens=8000,
-        )
-        messages.append({"role": "assistant", "content": response.content})
-
-        tool_calls = [
-            block for block in response.content if block.type == "tool_use"
-        ]
-        if not tool_calls:
-            force = trigger_hooks("Stop", messages)
-            if force:
-                messages.append({"role": "user", "content": force})
-                continue
-            print("\033[35m[Subagent done]\033[0m")
-            return extract_text(response.content) or "(no summary)"
-
-        results = []
-        for block in tool_calls:
-            output = execute_tool(block, SUB_HANDLERS)
-            print(f"  \033[90m[sub] {block.name}: {output[:100]}\033[0m")
-            results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": output,
-            })
-        messages.append({"role": "user", "content": results})
-
-    print("\033[35m[Subagent stopped]\033[0m")
-    return "Subagent stopped after 30 turns without a final answer."
-
-
-TASK_TOOL = {
-    "name": "task",
-    "description": "Run a subagent with fresh conversation context and return its final text.",
-    "input_schema": {
-        "type": "object",
-        "properties": {"prompt": {"type": "string", "minLength": 1}},
-        "required": ["prompt"],
-    },
-}
-
-TOOLS = [*BASE_TOOLS, TASK_TOOL]
-TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
-
-
-# -- Parent agent loop --
 
 def agent_loop(messages: list):
     while True:
@@ -346,7 +361,7 @@ def agent_loop(messages: list):
 
         results = []
         for block in tool_calls:
-            output = execute_tool(block, TOOL_HANDLERS)
+            output = execute_tool(block)
             results.append({
                 "type": "tool_result",
                 "tool_use_id": block.id,
@@ -356,14 +371,14 @@ def agent_loop(messages: list):
 
 
 if __name__ == "__main__":
-    print("s06: Subagent - fresh messages, final text returns")
+    print("s07: Skill Loading - catalog first, full content on demand")
     print("Enter a question, press Enter to send. Type q to quit.\n")
 
     history = []
     while True:
         try:
             # \001/\002 tell Readline the ANSI escapes have zero display width.
-            query = input("\001\033[36m\002s06 >> \001\033[0m\002")
+            query = input("\001\033[36m\002s07 >> \001\033[0m\002")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):

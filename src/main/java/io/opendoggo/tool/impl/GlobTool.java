@@ -39,7 +39,11 @@ public class GlobTool implements ToolHandler {
                 + "the workspace root, e.g. src/**/*.java "
                 + "or *.md. Use this instead of running "
                 + "find/ls via bash. Returns up to 150 "
-                + "sorted paths.";
+                + "sorted paths. Note: **/*.ext does not "
+                + "match files at the workspace root "
+                + "(the / requires a directory level); "
+                + "use *.ext for root files or "
+                + "{*.ext,**/*.ext} for both.";
     }
 
     @Override
