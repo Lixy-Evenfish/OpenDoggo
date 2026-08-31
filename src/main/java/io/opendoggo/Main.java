@@ -9,10 +9,12 @@ import io.opendoggo.model.impl.AnthropicClient;
 import io.opendoggo.permission.ConsoleApprovalPrompt;
 import io.opendoggo.permission.PermissionChecker;
 import io.opendoggo.tool.ToolDispatch;
+import io.opendoggo.tool.ToolHandler;
 import io.opendoggo.tool.impl.EditFileTool;
 import io.opendoggo.tool.impl.GlobTool;
 import io.opendoggo.tool.impl.ReadFileTool;
 import io.opendoggo.tool.impl.ShellTool;
+import io.opendoggo.tool.impl.TaskTool;
 import io.opendoggo.tool.impl.TodoWrite;
 import io.opendoggo.tool.impl.WriteFileTool;
 
@@ -83,16 +85,8 @@ public final class Main {
                         + "All destructive operations "
                         + "require user approval.";
 
-        ToolDispatch toolDispatch = initTools(workingDirectory);
-        ArrayNode toolDefinitions = toolDispatch.toolDefinitions();
-        ModelClient modelClient = new AnthropicClient(
-                baseUrl,
-                apiKey,
-                modelId,
-                systemPrompt,
-                toolDefinitions
-        );
-
+        // s06：reader 与 hookRunner 必须先于工具装配——
+        // task 工具的子循环要复用同一个 hookRunner。
         BufferedReader reader = new BufferedReader(
                 new InputStreamReader(
                         System.in,
@@ -112,6 +106,53 @@ public final class Main {
                 workingDirectory
         );
 
+        // s06：子代理提示词——只要求完成子任务并返回结论。
+        String subSystemPrompt =
+                "You are a coding agent at "
+                        + workingDirectory
+                        + ". Complete the given "
+                        + "task, then return a "
+                        + "concise final answer.";
+
+        // 子分发表只注册五个基础工具：无 task
+        // （只允许一层委派），也无 todo_write
+        // （对齐参考实现的严格五工具口径）。
+        ToolDispatch subDispatch =
+                initBaseTools(workingDirectory);
+
+        // AnthropicClient 在构造期固化 system 与 tools，
+        // 子循环只能用第二个 client 实例。
+        ModelClient subClient = new AnthropicClient(
+                baseUrl,
+                apiKey,
+                modelId,
+                subSystemPrompt,
+                subDispatch.toolDefinitions()
+        );
+
+        // 复用同一个 hookRunner：子代理的工具调用
+        // 走与父代理相同的权限门（委派不降级权限）。
+        AgentLoop subAgentLoop = new AgentLoop(
+                subClient,
+                hookRunner,
+                subDispatch
+        );
+
+        // task 是父循环的第七个工具，
+        // 内部同步驱动上面的子循环。
+        ToolDispatch toolDispatch = initTools(
+                workingDirectory,
+                new TaskTool(subAgentLoop)
+        );
+        ArrayNode toolDefinitions = toolDispatch.toolDefinitions();
+        ModelClient modelClient = new AnthropicClient(
+                baseUrl,
+                apiKey,
+                modelId,
+                systemPrompt,
+                toolDefinitions
+        );
+
         AgentLoop agentLoop = new AgentLoop(
                 modelClient,
                 hookRunner,
@@ -122,18 +163,35 @@ public final class Main {
     }
 
     /**
-     * 工具装配：创建注册表并登记全部工具。
-     * 新增工具 = 实现 ToolHandler 后在这里登记一行，
-     * tools 数组由注册表自动生成。
+     * 基础工具装配：五个无状态工具，
+     * 父子两张分发表共用同一批实现。
      */
-    private static ToolDispatch initTools(Path workingDirectory) {
+    private static ToolDispatch initBaseTools(
+            Path workingDirectory
+    ) {
         ToolDispatch toolDispatch = new ToolDispatch();
         toolDispatch.register(new ShellTool(workingDirectory));
         toolDispatch.register(new ReadFileTool(workingDirectory));
         toolDispatch.register(new WriteFileTool(workingDirectory));
         toolDispatch.register(new EditFileTool(workingDirectory));
         toolDispatch.register(new GlobTool(workingDirectory));
-        toolDispatch.register(new TodoWrite()); 
+        return toolDispatch;
+    }
+
+    /**
+     * 父循环工具装配：基础五工具 + todo_write
+     * + s06 的 task（第七个工具）。
+     * 新增工具 = 实现 ToolHandler 后在这里登记一行，
+     * tools 数组由注册表自动生成。
+     */
+    private static ToolDispatch initTools(
+            Path workingDirectory,
+            ToolHandler taskTool
+    ) {
+        ToolDispatch toolDispatch =
+                initBaseTools(workingDirectory);
+        toolDispatch.register(new TodoWrite());
+        toolDispatch.register(taskTool);
         return toolDispatch;
     }
 

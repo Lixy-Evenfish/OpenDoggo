@@ -1,124 +1,90 @@
-# s05: TodoWrite — 計画なき Agent は途中で道を外れる
+# s06: Subagent — サブタスクに独立したコンテキストを与える
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-s01 → s02 → s03 → s04 → `s05` → [s06](../s06_subagent/) → s07 → ... → s16 → s17
+s01 → s02 → s03 → s04 → s05 → `s06` → [s07](../s07_skill_loading/) → s08 → ... → s16 → s17
 
-> *"計画なき agent は風の向くままに"* — まず手順を列挙してから実行。長いタスクで見落としが減る。
+> Subagent は新しい `messages[]` から始まる。最終テキストだけが親ループへ戻り、中間会話は親コンテキストへ入らない。
 >
-> **Harness レイヤー**: 計画 — Agent が行動する前に考えさせる。
+> **Harness レイヤー**: 委任 — 明確なサブタスクを別の会話コンテキストで処理する。
 
 ---
 
 ## 課題
 
-Agent に複雑なタスクを与える：「全 Python ファイルを snake_case にリネームし、テストを実行し、失敗を修正して。」
-
-Agent は作業を開始する。3 つのファイルをリネーム、テストを実行、2 つの失敗を発見、修正を開始。修正しているうちに、本来の目的が「snake_case にリネーム」だったことを忘れる。テストの失敗に注意を全て持っていかれる。
-
-会話が長くなるほど悪化する：ツールの結果がコンテキストを埋め続け、システムプロンプトの影響力が希釈される。10 ステップのリファクタリング：ステップ 1-3 を終えた時点で Agent は即興で動き始める。ステップ 4-10 は既に注意の外に追い出されているから。
+Agent がバグを修正している。呼び出しチェーンを追うために多くのファイルを読み、すべてのツール呼び出しと結果が親の `messages[]` に残る。チェーンを把握した後は不要になる中間情報も、コンテキストを使い続ける。
 
 ---
 
 ## ソリューション
 
-![Todo Overview](images/todo-overview.ja.svg)
+![Subagent Overview](images/subagent-overview.ja.svg)
 
-S05 は S04 のツールディスパッチ、権限チェック、Hooks を保持し、`todo_write` とリマインダーカウンターを追加する。`todo_write` は計画状態だけを更新し、実際の作業は既存のツールが行う。
+`task` を呼ぶと、新しい `messages[]` を使う入れ子の Agent Loop が同期実行される。ループが終了すると、最終テキストが親会話の tool result になる。
 
-新しいツールも `TOOL_HANDLERS[block.name]` を経由する。3 回連続のツール使用ラウンドで `todo_write` が呼ばれなければ、Harness は 3 回目のツール結果にリマインダーを追加する。
+ここで分離するのはメッセージであり、プロセスやファイルシステムではない。親 Agent とサブエージェントは `WORKDIR` を共有するため、書き込みやコマンドは同じワークスペースへ作用する。サブエージェントは 5 つの基本ツールを持つが `task` はなく、親と同じ権限 Hooks とライフサイクル Hooks を使う。
 
 ---
 
 ## 仕組み
 
-**TodoManager** はメモリ上のタスクリストを保持し、更新を検証して、描画結果をモデルへ返す。`run_todo_write` は同じ状態を端末にも表示する：
+**run_subagent** は新しいメッセージリストを作り、入れ子のループを実行して、最終テキストを返す：
 
 ```python
-class TodoManager:
-    def __init__(self):
-        self.items = []
+SUB_TOOLS = list(BASE_TOOLS)  # no task tool
 
-    def update(self, todos: list | str) -> str:
-        # Parse and validate before replacing the current list.
-        validated = []
-        ...
-        self.items = validated
-        return self.render()
+def run_subagent(prompt: str) -> str:
+    messages = [{"role": "user", "content": prompt}]
 
-    def render(self) -> str:
-        # [ ] pending, [>] in progress, [x] completed
-        ...
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        tool_calls = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+        if not tool_calls:
+            return extract_text(response.content) or "(no summary)"
 
+        results = []
+        for block in tool_calls:
+            output = execute_tool(block, SUB_HANDLERS)
+            results.append({... "content": output})
+        messages.append({"role": "user", "content": results})
 
-TODO = TodoManager()
-
-def run_todo_write(todos: list | str) -> str:
-    output = TODO.update(todos)
-    print(output)
-    return output
+    return "Subagent stopped after 30 turns without a final answer."
 ```
 
-1 回の更新は最大 20 項目で、各項目には空でない `content` が必要となり、`in_progress` にできる項目は同時に 1 つだけ。文字列入力は JSON または Python のリスト表現として、`eval` を使わずに解析する。
-
-ツール定義は他の 5 つと一緒にディスパッチマップに追加される：
+メイン Agent の呼び出しは、他のツールと同じ：
 
 ```python
-TOOLS = [
-    {"name": "bash",       ...},
-    {"name": "read_file",  ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file",  ...},
-    {"name": "glob",       ...},
-    # s05: 新規追加
-    {"name": "todo_write", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-     },
+TASK_TOOL = {
+    "name": "task",
+    "description": "Run a subagent with fresh conversation context and return its final text.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"prompt": {"type": "string"}},
+        "required": ["prompt"],
     },
-]
+}
 
-TOOL_HANDLERS["todo_write"] = run_todo_write
+TOOLS = [*BASE_TOOLS, TASK_TOOL]
+TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 ```
 
-**リマインダー**：3 回連続のツール使用ラウンドで `todo_write` が呼ばれなければ、リマインダーを 3 回目の結果に追加し、カウンターをリセットする：
+実際の境界は次のとおり：
 
-```python
-rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-if rounds_since_todo >= 3:
-    results.append({
-        "type": "text",
-        "text": "<reminder>Update your todos.</reminder>",
-    })
-    rounds_since_todo = 0
-```
+| 決定 | 選択 | 理由 |
+|------|------|------|
+| 会話 | 新しい `messages[]` | 親の会話をサブエージェントへコピーしない |
+| 実行 | 同じプロセスと `WORKDIR` | どちらのループからもファイル変更が見える |
+| 戻り値 | 最終テキストのみ | 子のツール呼び出しと結果を親 messages へコピーしない |
+| 委任の深さ | `SUB_TOOLS` に `task` なし | 本章では 1 階層の委任だけを許可 |
+| ツールポリシー | Hooks を共有 | 親子で同じ権限チェックを使う |
 
-Agent がタスクを受け取った後の典型的な流れ：まず `todo_write` を呼び出して全手順を列挙（全て `pending`）→ 一つの手順に取り掛かり、`in_progress` に変更 → 完了したら `completed` に変更 → 次の `pending` を見る → 続行。
-
-**重要な洞察**：todo_write は Agent に**実行能力**を何も追加しない。追加するのは**計画能力**だ。
-
----
-
-## s04 からの変更
-
-| コンポーネント | 変更前 (s04) | 変更後 (s05) |
-|--------------|-------------|-------------|
-| ツール数 | 5 (bash, read, write, edit, glob) | 6 (+todo_write) |
-| 計画能力 | なし | ステータス付き TODO リスト + リマインダー |
-| SYSTEM プロンプト | 汎用プロンプト | 「先に計画してから実行」のガイダンスを追加 |
-| ループ | ツールディスパッチと Hooks | 同じ分配経路に rounds_since_todo とリマインダー注入を追加 |
+親 Agent は他のツールと同じ handler map から `task` を実行する。サブエージェントは `SUB_SYSTEM`、`SUB_TOOLS`、ローカルな `messages` リストを使う。
 
 ---
 
@@ -126,24 +92,24 @@ Agent がタスクを受け取った後の典型的な流れ：まず `todo_writ
 
 ```sh
 cd learn-claude-code
-python s05_todo_write/code.py
+python s06_subagent/code.py
 ```
 
 以下のプロンプトを試してみよう：
 
-1. `Refactor s05_todo_write/example/hello.py: add type hints, docstrings, and a main guard`（まず 3 手順を列挙してから実行するはず）
-2. `Create a Python package under s05_todo_write/example/demo_pkg with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review Python files under s05_todo_write/example and fix any style issues`
+1. `Use a subtask to find what testing framework this project uses`（サブエージェントがファイルを読み、メイン Agent は結論のみ受け取る）
+2. `Delegate: read all .py files in agents/ and summarize what each one does`
+3. `Use a task to create s06_subagent/example/string_tools.py with a slugify(text: str) function, then verify it from the parent agent`
 
-観察のポイント：最初のツール呼び出しは `todo_write` か？ TODO は何手順列挙されたか？ 実行中にステータスが `pending` から `in_progress` / `completed` に変わったか？
+観察のポイント：`[Subagent started]` / `[Subagent done]` が表示されるか？ サブエージェントのツール呼び出しが `[sub] ...` と表示されるか？ 親 Agent は `task` が返した最終テキストだけを受け取るか？
 
 ---
 
 ## 次へ
 
-Agent は計画できるようになった。しかしタスクが大きすぎる場合、例えば「認証モジュール全体をリファクタリング」、TODO リストだけでは不十分。そのタスク自体が数十のサブタスクの集合体で、同じ会話のコンテキストに押し込めると溢れてしまう。
+Agent はタスクを分割できるようになった。しかし各タスクに必要な知識は異なる。フロントエンドコンポーネントの変更には React 規約が必要で、SQL を書くにはテーブル構造を知る必要がある。これらの知識をすべて system prompt に詰め込むと、コンテキストが溢れてしまう。
 
-→ s06 Subagent：大きなタスクをサブタスクに分割し、それぞれを独立した Agent に任せる。それぞれが独自のクリーンなコンテキストを持ち、相互汚染がない。
+→ s07 Skill Loading：スキルをオンデマンドで注入する。system prompt にドキュメントを積み上げるのではなく、必要なときだけ読み込む。ファイルを読むのと同じくらい自然に。
 
 
-<!-- translation-sync: zh@v1, en@v1, ja@v1 -->
+<!-- translation-sync: zh@v2, en@v2, ja@v2 -->

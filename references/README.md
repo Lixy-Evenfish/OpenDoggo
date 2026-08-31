@@ -1,124 +1,90 @@
-# s05: TodoWrite — An Agent Without a Plan Drifts Off Course
+# s06: Subagent — Give a Subtask Its Own Context
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-s01 → s02 → s03 → s04 → `s05` → [s06](../s06_subagent/) → s07 → ... → s16 → s17
+s01 → s02 → s03 → s04 → s05 → `s06` → [s07](../s07_skill_loading/) → s08 → ... → s16 → s17
 
-> *"An agent without a plan goes wherever the wind blows"* — List the steps first, then execute. Complex tasks are less likely to miss steps.
+> A subagent starts with a fresh `messages[]`. Its final text returns to the parent; its intermediate conversation does not.
 >
-> **Harness Layer**: Planning — Let the Agent think before it acts.
+> **Harness Layer**: Delegation — Run a focused task in a separate conversation context.
 
 ---
 
 ## The Problem
 
-Give the Agent a complex task: "Rename all Python files to snake_case, run tests, and fix failures."
-
-The Agent starts working, renames 3 files, runs a test, finds 2 failures, starts fixing. While fixing, it forgets the original goal was "rename to snake_case", the test failures have consumed all its attention.
-
-The longer the conversation, the worse it gets: tool results keep filling the context, diluting the system prompt's influence. A 10-step refactoring: after steps 1-3, the Agent starts improvising because steps 4-10 have been pushed out of its attention.
+The Agent is fixing a bug. It reads many files to trace the call chain, and every tool call and result stays in the parent's `messages[]`. Once the call chain is understood, most of those intermediate details are no longer needed, but they still occupy context.
 
 ---
 
 ## The Solution
 
-![Todo Overview](images/todo-overview.en.svg)
+![Subagent Overview](images/subagent-overview.en.svg)
 
-S05 keeps the tool dispatch, permissions, and hooks from S04, then adds `todo_write` and a reminder counter. `todo_write` only updates planning state; the existing tools still perform the work.
+Calling `task` synchronously runs a nested agent loop with a fresh `messages[]`. When that loop finishes, its final text becomes the tool result in the parent conversation.
 
-The new tool uses the same `TOOL_HANDLERS[block.name]` dispatch path. After three consecutive tool-use rounds without `todo_write`, the harness adds a reminder to that round's tool results.
+This is message isolation, not process or filesystem isolation. Parent and subagent run in the same Python process and share `WORKDIR`, so writes and commands still affect the same workspace. The subagent has the five base tools but no `task`, and its tool calls use the same permission and lifecycle hooks as the parent.
 
 ---
 
 ## How It Works
 
-**TodoManager** owns the in-memory list, validates updates, and renders the state returned to the model. `run_todo_write` also prints that state in the terminal:
+**run_subagent** creates the fresh message list, runs the nested loop, and returns the final text:
 
 ```python
-class TodoManager:
-    def __init__(self):
-        self.items = []
+SUB_TOOLS = list(BASE_TOOLS)  # no task tool
 
-    def update(self, todos: list | str) -> str:
-        # Parse and validate before replacing the current list.
-        validated = []
-        ...
-        self.items = validated
-        return self.render()
+def run_subagent(prompt: str) -> str:
+    messages = [{"role": "user", "content": prompt}]
 
-    def render(self) -> str:
-        # [ ] pending, [>] in progress, [x] completed
-        ...
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        tool_calls = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+        if not tool_calls:
+            return extract_text(response.content) or "(no summary)"
 
+        results = []
+        for block in tool_calls:
+            output = execute_tool(block, SUB_HANDLERS)
+            results.append({... "content": output})
+        messages.append({"role": "user", "content": results})
 
-TODO = TodoManager()
-
-def run_todo_write(todos: list | str) -> str:
-    output = TODO.update(todos)
-    print(output)
-    return output
+    return "Subagent stopped after 30 turns without a final answer."
 ```
 
-An update may contain at most 20 items, each item needs non-empty `content`, and only one item may be `in_progress`. The string input path accepts JSON or a Python list representation without using `eval`.
-
-The tool definition joins the other 5 in the dispatch map:
+The main Agent calls it just like any other tool:
 
 ```python
-TOOLS = [
-    {"name": "bash",       ...},
-    {"name": "read_file",  ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file",  ...},
-    {"name": "glob",       ...},
-    # s05: new entry
-    {"name": "todo_write", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-     },
+TASK_TOOL = {
+    "name": "task",
+    "description": "Run a subagent with fresh conversation context and return its final text.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"prompt": {"type": "string"}},
+        "required": ["prompt"],
     },
-]
+}
 
-TOOL_HANDLERS["todo_write"] = run_todo_write
+TOOLS = [*BASE_TOOLS, TASK_TOOL]
+TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 ```
 
-**Reminder**: after three tool-use rounds without `todo_write`, the reminder is appended to the third round's results and the counter resets:
+The boundary is:
 
-```python
-rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-if rounds_since_todo >= 3:
-    results.append({
-        "type": "text",
-        "text": "<reminder>Update your todos.</reminder>",
-    })
-    rounds_since_todo = 0
-```
+| Decision | Choice | Reason |
+|----------|--------|--------|
+| Conversation | Fresh `messages[]` | Parent history is not copied into the subagent |
+| Execution | Same process and `WORKDIR` | Filesystem changes remain visible to both loops |
+| Return value | Final text only | Child tool calls and results are not copied into parent messages |
+| Delegation depth | No `task` in `SUB_TOOLS` | This lesson permits one delegation level |
+| Tool policy | Shared Hooks | Parent and subagent use the same permission checks |
 
-Typical flow when the Agent receives a task: first call `todo_write` to list all steps (all `pending`) → pick one step, set it to `in_progress` → complete it, set to `completed` → look at the next `pending` → continue.
-
-**Key insight**: todo_write doesn't give the Agent any additional **execution capability**. What it adds is **planning capability**.
-
----
-
-## Changes from s04
-
-| Component | Before (s04) | After (s05) |
-|-----------|-------------|-------------|
-| Tool count | 5 (bash, read, write, edit, glob) | 6 (+todo_write) |
-| Planning | None | Stateful TODO list + reminder |
-| SYSTEM prompt | Generic prompt | Added "plan before executing" guidance |
-| Loop | Tool dispatch and hooks | Same dispatch path, plus rounds_since_todo and reminder injection |
+The parent dispatches `task` through the same handler map as its other tools. The subagent uses `SUB_SYSTEM`, `SUB_TOOLS`, and its own local `messages` list.
 
 ---
 
@@ -126,24 +92,24 @@ Typical flow when the Agent receives a task: first call `todo_write` to list all
 
 ```sh
 cd learn-claude-code
-python s05_todo_write/code.py
+python s06_subagent/code.py
 ```
 
 Try these prompts:
 
-1. `Refactor s05_todo_write/example/hello.py: add type hints, docstrings, and a main guard` (should list 3 steps first, then execute)
-2. `Create a Python package under s05_todo_write/example/demo_pkg with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review Python files under s05_todo_write/example and fix any style issues`
+1. `Use a subtask to find what testing framework this project uses` (sub-Agent reads files, main Agent receives only the conclusion)
+2. `Delegate: read all .py files in agents/ and summarize what each one does`
+3. `Use a task to create s06_subagent/example/string_tools.py with a slugify(text: str) function, then verify it from the parent agent`
 
-What to watch for: Was the first tool call `todo_write`? How many TODO steps were listed? Did statuses move from `pending` to `in_progress` / `completed` during execution?
+What to watch for: Do `[Subagent started]` / `[Subagent done]` appear? Do subagent tool calls print as `[sub] ...`? Does the parent continue with only the final text returned by `task`?
 
 ---
 
 ## What's Next
 
-The Agent can plan now. But if a task is too large, say "refactor the entire auth module", a TODO list alone isn't enough. That task is itself a collection of dozens of subtasks that would drown in a single conversation's context.
+The Agent can now break tasks apart. But different tasks require different knowledge: editing frontend components needs React conventions, writing SQL needs table schemas. Stuffing all this knowledge into the system prompt would blow up the context.
 
-→ s06 Subagent: Break large tasks into subtasks, each handled by an independent Agent with its own clean context, no cross-contamination.
+→ s07 Skill Loading: Inject skills on demand instead of piling documents into the system prompt. Load only when needed, as natural as reading a file.
 
 
-<!-- translation-sync: zh@v1, en@v1, ja@v1 -->
+<!-- translation-sync: zh@v2, en@v2, ja@v2 -->

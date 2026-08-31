@@ -1,124 +1,90 @@
-# s05: TodoWrite — 没有计划的 Agent，做着做着就偏了
+# s06: Subagent — 给子任务一段独立上下文
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-s01 → s02 → s03 → s04 → `s05` → [s06](../s06_subagent/) → s07 → ... → s16 → s17
+s01 → s02 → s03 → s04 → s05 → `s06` → [s07](../s07_skill_loading/) → s08 → ... → s16 → s17
 
-> *"没有计划的 agent 走哪算哪"* — 先列步骤再动手，长任务更不容易漏项。
+> Subagent 从全新的 `messages[]` 开始。最终文本返回父循环，中间对话不会进入父上下文。
 >
-> **Harness 层**: 规划 — 让 Agent 在动手之前先想清楚。
+> **Harness 层**: 委派 — 在另一段对话上下文中处理一个明确的子任务。
 
 ---
 
 ## 问题
 
-给 Agent 一个复杂任务："把所有 Python 文件改成 snake_case 命名，然后跑测试，修好失败。"
-
-Agent 开始干活，改了 3 个文件，跑了个测试，发现 2 个失败，开始修。修着修着，它忘了最初是"改成 snake_case"，测试失败把注意力全吸走了。
-
-对话越长越严重：工具结果不断填满上下文，系统提示的影响力被稀释。一个 10 步重构，做完 1-3 步就开始即兴发挥，因为 4-10 步已经被挤出注意力了。
+Agent 在修一个 bug。为了追踪调用链，它读取了许多文件；每次工具调用和结果都会留在父循环的 `messages[]` 中。调用链已经弄清以后，多数中间细节不再需要，却仍然占用上下文。
 
 ---
 
 ## 解决方案
 
-![Todo Overview](images/todo-overview.svg)
+![Subagent Overview](images/subagent-overview.svg)
 
-S05 保留 S04 的工具分发、权限检查和 Hooks，再加入 `todo_write` 与 reminder 计数器。`todo_write` 只更新计划状态，实际工作仍由原有工具完成。
+调用 `task` 时，会同步运行一个使用全新 `messages[]` 的嵌套 Agent Loop。循环结束后，它的最终文本会成为父对话中的工具结果。
 
-新工具仍通过 `TOOL_HANDLERS[block.name]` 分发。连续三个工具调用轮次没有使用 `todo_write` 时，Harness 会把 reminder 追加到第三轮的工具结果中。
+这里隔离的是消息，不是进程或文件系统。父 Agent 与子 Agent 共享 `WORKDIR`，写文件和命令仍会影响同一个工作区。子 Agent 拥有五个基础工具，但没有 `task`；它的工具调用与父 Agent 使用同一组权限和生命周期 Hooks。
 
 ---
 
 ## 工作原理
 
-**TodoManager** 持有内存中的任务列表，负责校验更新，并把渲染结果返回给模型。`run_todo_write` 同时把这份状态打印到终端：
+**run_subagent** 创建新的消息列表，运行嵌套循环，并返回最终文本：
 
 ```python
-class TodoManager:
-    def __init__(self):
-        self.items = []
+SUB_TOOLS = list(BASE_TOOLS)  # no task tool
 
-    def update(self, todos: list | str) -> str:
-        # Parse and validate before replacing the current list.
-        validated = []
-        ...
-        self.items = validated
-        return self.render()
+def run_subagent(prompt: str) -> str:
+    messages = [{"role": "user", "content": prompt}]
 
-    def render(self) -> str:
-        # [ ] pending, [>] in progress, [x] completed
-        ...
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL, system=SUB_SYSTEM,
+            messages=messages, tools=SUB_TOOLS, max_tokens=8000,
+        )
+        messages.append({"role": "assistant", "content": response.content})
+        tool_calls = [
+            block for block in response.content if block.type == "tool_use"
+        ]
+        if not tool_calls:
+            return extract_text(response.content) or "(no summary)"
 
+        results = []
+        for block in tool_calls:
+            output = execute_tool(block, SUB_HANDLERS)
+            results.append({... "content": output})
+        messages.append({"role": "user", "content": results})
 
-TODO = TodoManager()
-
-def run_todo_write(todos: list | str) -> str:
-    output = TODO.update(todos)
-    print(output)
-    return output
+    return "Subagent stopped after 30 turns without a final answer."
 ```
 
-一次更新最多包含 20 项；每项都必须有非空的 `content`；同一时间只能有一个 `in_progress`。字符串输入可以是 JSON，也可以是 Python 列表表示，解析过程不使用 `eval`。
-
-工具定义和其他 5 个工具一起加入 dispatch map：
+主 Agent 调用时，跟调其他工具一样：
 
 ```python
-TOOLS = [
-    {"name": "bash",       ...},
-    {"name": "read_file",  ...},
-    {"name": "write_file", ...},
-    {"name": "edit_file",  ...},
-    {"name": "glob",       ...},
-    # s05: 新增一条
-    {"name": "todo_write", "description": "Create and manage a task list ...",
-     "input_schema": {
-         "type": "object",
-         "properties": {
-             "todos": {
-                 "type": "array",
-                 "items": {
-                     "type": "object",
-                     "properties": {
-                         "content": {"type": "string"},
-                         "status": {"type": "string", "enum": ["pending", "in_progress", "completed"]},
-                     },
-                 },
-             },
-         },
-     },
+TASK_TOOL = {
+    "name": "task",
+    "description": "Run a subagent with fresh conversation context and return its final text.",
+    "input_schema": {
+        "type": "object",
+        "properties": {"prompt": {"type": "string"}},
+        "required": ["prompt"],
     },
-]
+}
 
-TOOL_HANDLERS["todo_write"] = run_todo_write
+TOOLS = [*BASE_TOOLS, TASK_TOOL]
+TOOL_HANDLERS = {**BASE_HANDLERS, "task": run_subagent}
 ```
 
-**Reminder**：连续三个工具调用轮次没有使用 `todo_write` 时，reminder 会追加到第三轮的结果中，随后计数器清零：
+实际边界如下：
 
-```python
-rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
-if rounds_since_todo >= 3:
-    results.append({
-        "type": "text",
-        "text": "<reminder>Update your todos.</reminder>",
-    })
-    rounds_since_todo = 0
-```
+| 决策 | 选择 | 原因 |
+|------|------|------|
+| 对话 | 全新的 `messages[]` | 不把父对话复制给子 Agent |
+| 执行 | 同一进程和 `WORKDIR` | 两个循环都能看到文件系统修改 |
+| 返回值 | 只返回最终文本 | 子 Agent 的工具调用和结果不进入父消息列表 |
+| 委派深度 | `SUB_TOOLS` 中没有 `task` | 本章只允许一层委派 |
+| 工具策略 | 共享 Hooks | 父子循环使用相同的权限检查 |
 
-Agent 收到任务后的典型流程：先调 `todo_write` 列出所有步骤（全 `pending`）→ 做一个步骤，改成 `in_progress` → 做完改成 `completed` → 看下一个 `pending` → 继续。
-
-**关键洞察**：todo_write 不给 Agent 增加任何**执行能力**。它增加的是**规划能力**。
-
----
-
-## 相对 s04 的变更
-
-| 组件 | 之前 (s04) | 之后 (s05) |
-|------|-----------|-----------|
-| 工具数量 | 5 (bash, read, write, edit, glob) | 6 (+todo_write) |
-| 规划能力 | 无 | 带状态的 TODO 列表 + reminder |
-| SYSTEM 提示 | 通用提示 | 加入 "先计划再执行" 引导 |
-| 循环 | 工具分发与 Hooks | 保留分发路径，加入 rounds_since_todo 和 reminder 注入 |
+父 Agent 与其他工具一样，通过 handler map 分发 `task`。子 Agent 使用 `SUB_SYSTEM`、`SUB_TOOLS` 和自己的局部 `messages` 列表。
 
 ---
 
@@ -126,24 +92,24 @@ Agent 收到任务后的典型流程：先调 `todo_write` 列出所有步骤（
 
 ```sh
 cd learn-claude-code
-python s05_todo_write/code.py
+python s06_subagent/code.py
 ```
 
 试试这些 prompt：
 
-1. `Refactor s05_todo_write/example/hello.py: add type hints, docstrings, and a main guard`（先列 3 步再执行）
-2. `Create a Python package under s05_todo_write/example/demo_pkg with __init__.py, utils.py, and tests/test_utils.py`
-3. `Review Python files under s05_todo_write/example and fix any style issues`
+1. `Use a subtask to find what testing framework this project uses`（子 Agent 去读文件，主 Agent 只收结论）
+2. `Delegate: read all .py files in agents/ and summarize what each one does`
+3. `Use a task to create s06_subagent/example/string_tools.py with a slugify(text: str) function, then verify it from the parent agent`
 
-观察重点：第一次工具调用是不是 `todo_write`？TODO 列了几步？执行过程中状态有没有从 `pending` 变成 `in_progress` / `completed`？
+观察重点：是否出现 `[Subagent started]` / `[Subagent done]`？子 Agent 的工具调用是否以 `[sub] ...` 输出？父 Agent 是否只接收到 `task` 返回的最终文本？
 
 ---
 
 ## 接下来
 
-Agent 能计划了。但如果一个任务太大，比如"重构整个认证模块"，光靠 TODO 列表不够。这个任务本身就是几十个小任务的集合，放在同一个对话里会被上下文淹没。
+Agent 现在能拆任务了。但每个任务需要的知识不一样：改前端组件需要知道 React 规范，写 SQL 需要知道表结构。这些知识全塞进 system prompt，上下文直接爆了。
 
-s06 Subagent → 把大任务拆成子任务，每个子任务派一个独立的 Agent。它们有自己的干净上下文，不会互相污染。
+s07 Skill Loading → 技能按需注入，不在 system prompt 里堆文档。用到的时候才加载，和读文件一样自然。
 
 
-<!-- translation-sync: zh@v1, en@v1, ja@v1 -->
+<!-- translation-sync: zh@v2, en@v2, ja@v2 -->
