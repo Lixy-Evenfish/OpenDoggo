@@ -27,7 +27,7 @@ v2 的主线是让 agent loop 成为稳定内核,并扩展其他刚需功能：�
 
 - **Hooks** — Agent loop 引入 hook 与 trigger 机制，在 4 个关键位置（`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`）设置挂载点，`AgentLoop` 的代码就此固定，后续扩展只需在 `Main` 注册 hook（权限、横幅、预览已挂上，示例 hook 补全中）
 - **TodoWrite**— 计划工具，让 agent 显式维护任务清单
-- **SubAgent**（尚未完成）— 子 agent，把独立子任务委派出去
+- **SubAgent**— 子 agent，允主agent通过调用工具的方法，把独立子任务委派出去
 - **Skill**（尚未完成）— 技能加载机制
 
 ## 环境要求
