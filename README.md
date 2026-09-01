@@ -30,7 +30,7 @@ v2 版本的目标是引入循环钩子机制让 agent loop 成为稳定内核�
 
 ## v3
 
-v3 版本的目标是给 agent 增加 ContextCompact 上下文压缩、MCP tools 这 2 个进阶级的拓展。
+v3 版本的目标是给 agent 增加 ContextCompact 上下文压缩、MCP tools 这 2 个进阶级的拓展，以及代码沙箱工具。
 
 新增功能：
 - **ContextCompact上下文压缩** — 上下文总会满，先整理、再总结。每轮模型调用前运行压缩管线，五个策略按成本递进：
@@ -41,7 +41,7 @@ v3 版本的目标是给 agent 增加 ContextCompact 上下文压缩、MCP tools
   5. **响应式补救**：API 报 `prompt_too_long` 时保留最近 5 条、摘要更早历史，重试一次。
   策略 1–3 零额外 API 调用且全部可从磁盘恢复；模型还可用 `compact` 工具在阶段结束时主动请求压缩（等整批结果入史后执行摘要）。
 - **单进程模拟 MCP tools** — 模型调 `connect_mcp` 连接 server，`McpClient` 充当 tools/list 与 tools/call 的进程内替身；`McpRegistry` 把工具以 `mcp__{server}__{tool}` 前缀登记进分发表并刷新 client 的 tools 数组，下一轮请求即可调用。授权只认宿主侧策略表，server 自标的 `readOnlyHint` 不作为依据，未配置默认需用户审批。
-- **代码沙箱** - 
+- **代码沙箱** — 新增 `run_code` 工具，把代码放进一次性容器执行，以机制隔离宿主风险：无网络、根文件系统只读、仅挂载本次运行的临时目录、非特权用户、资源限额与双层超时；容器不继承宿主环境变量，密钥进不了沙箱。权限管线靠用户审批（策略），沙箱靠机制保证出不去——隔离代替审批，因此免审批。需本机 Docker，支持 Python、Node.js、Bash。
 
 ## v4（未完成）
 
@@ -99,6 +99,15 @@ java -jar target/opendoggo-0.1.0-SNAPSHOT.jar
 - 参数：`command`（string，必填）
 - 120s 超时，超时强杀整个进程树；stdout 与 stderr 合并，输出上限 50000 字符；无输出返回 `(no output)`
 - 工具自身不带策略；危险命令由权限管线在执行前拦截（见下文[权限](#权限)）
+
+### run_code
+
+在一次性容器里执行代码，以机制隔离代替权限审批（不注册权限规则）。执行模型生成的不受信任代码时优先用它，`bash` 只做工作区操作。
+
+- 参数：`language`（枚举：`python` / `node` / `bash`）、`code`（代码字符串，均必填）
+- 隔离：无网络；根文件系统只读；仅 `.sandbox/` 下本次运行目录可写；非特权用户；内存、处理器、进程数限额
+- 超时：容器内定时自杀、宿主强杀兜底；输出上限两万字符，超限全量落盘并返回文件路径
+- 前置：本机 Docker；Python 首次使用前需拉取一次镜像（Node.js 与 Bash 复用已有镜像），缺失时返回错误提示而非静默下载
 
 ### read_file
 
@@ -230,6 +239,7 @@ io.opendoggo
 ├── permission
 │   ├── PermissionChecker   三道闸门：硬拒绝表、规则匹配、用户审批
 │   └── ApprovalPrompt      闸门 3 审批回调（Main 提供控制台实现）
+├── sandbox.SandboxRunner   代码沙箱：一次性容器、资源限额、双层超时
 ├── tool
 │   ├── ToolHandler         工具接口：name / description / schema / execute
 │   ├── ToolDispatch        注册表：按名分发，自动生成 tools 数组
@@ -253,7 +263,7 @@ io.opendoggo
 
 **启动目录即 agent 工作区。** bash 命令是真实执行的，具有写权限。权限管线的拒绝表与规则匹配是教学级子串/正则防护，容易绕过，不构成安全边界；闸门 3 的默认拒绝只是审批提示，不是强隔离。请勿在重要目录直接运行。
 
-**子进程继承环境变量。** agent 执行的 shell 可读取 `ANTHROPIC_API_KEY`，存在 prompt injection 泄露风险。
+**子进程继承环境变量。** agent 执行的 shell（`bash` 工具）可读取 `ANTHROPIC_API_KEY`，存在 prompt injection 泄露风险；跑不受信任的代码请改用 `run_code`，容器不继承宿主环境变量，密钥进不了沙箱。沙箱防御代码越权（文件、网络、资源），不防御内核级容器逃逸。
 
 ## 许可
 

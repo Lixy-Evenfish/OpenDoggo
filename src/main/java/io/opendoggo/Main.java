@@ -10,6 +10,7 @@ import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.impl.AnthropicClient;
 import io.opendoggo.permission.ConsoleApprovalPrompt;
 import io.opendoggo.permission.PermissionChecker;
+import io.opendoggo.sandbox.SandboxRunner;
 import io.opendoggo.skill.SkillLoader;
 import io.opendoggo.tool.ToolDispatch;
 import io.opendoggo.tool.ToolHandler;
@@ -19,6 +20,7 @@ import io.opendoggo.tool.impl.EditFileTool;
 import io.opendoggo.tool.impl.GlobTool;
 import io.opendoggo.tool.impl.LoadSkillTool;
 import io.opendoggo.tool.impl.ReadFileTool;
+import io.opendoggo.tool.impl.RunCodeTool;
 import io.opendoggo.tool.impl.ShellTool;
 import io.opendoggo.tool.impl.TaskTool;
 import io.opendoggo.tool.impl.TodoWrite;
@@ -136,6 +138,16 @@ public final class Main {
                         + "tools to solve tasks. "
                         + "Call connect_mcp before "
                         + "using a server.";
+        // 沙箱：跑代码交给 run_code——机制隔离
+        // （无网络/无宿主文件/无宿主环境变量）
+        // 代替用户审批；bash 只做工作区操作。
+        String sandbox =
+                "Use run_code to execute or "
+                        + "verify code in an isolated "
+                        + "sandbox (no network, no host "
+                        + "files, no host environment "
+                        + "variables). Use bash only "
+                        + "for workspace operations.";
 
         String systemPrompt = identity
                 + " " + planning
@@ -143,6 +155,7 @@ public final class Main {
                 + " " + approval
                 + " " + compactionSafety
                 + " " + mcp
+                + " " + sandbox
                 + "\n\n" + skills;
         // s06：reader 与权限先于工具装配——
         // 父/子两个 hookRunner 都依赖 permissionChecker。
@@ -245,11 +258,18 @@ public final class Main {
         // task 是父循环的第七个工具，
         // 内部同步驱动上面的子循环；
         // load_skill 是第八个，查询 SkillLoader 注册表。
+        // 沙箱：run_code 的领域逻辑（一次性容器、
+        // 资源限额、双层超时）——无权限规则，
+        // 机制隔离代替审批。
+        SandboxRunner sandboxRunner =
+                new SandboxRunner(workingDirectory);
+
         ToolDispatch toolDispatch = initTools(
                 workingDirectory,
                 new TaskTool(subAgentLoop),
                 skillLoader,
-                mcpRegistry
+                mcpRegistry,
+                sandboxRunner
         );
         ArrayNode toolDefinitions = toolDispatch.toolDefinitions();
         AnthropicClient modelClient = new AnthropicClient(
@@ -303,7 +323,9 @@ public final class Main {
      * 调用在 AgentLoop 里 hooks 之前拦截，
      * execute 是走不到的兜底）
      * + s14 的 connect_mcp（第十个，仅父循环——
-     * 连接/发现都在 McpRegistry，子代理保持五基础工具口径）。
+     * 连接/发现都在 McpRegistry，子代理保持五基础工具口径）
+     * + 沙箱的 run_code（第十一个，仅父循环——
+     * 机制隔离的代码执行，见 sandbox.SandboxRunner）。
      * 新增工具 = 实现 ToolHandler 后在这里登记一行，
      * tools 数组由注册表自动生成。
      */
@@ -311,7 +333,8 @@ public final class Main {
             Path workingDirectory,
             ToolHandler taskTool,
             SkillLoader skillLoader,
-            McpRegistry mcpRegistry
+            McpRegistry mcpRegistry,
+            SandboxRunner sandboxRunner
     ) {
         ToolDispatch toolDispatch =
                 initBaseTools(workingDirectory);
@@ -320,6 +343,7 @@ public final class Main {
         toolDispatch.register(new LoadSkillTool(skillLoader));
         toolDispatch.register(new CompactTool());
         toolDispatch.register(new ConnectMcpTool(mcpRegistry));
+        toolDispatch.register(new RunCodeTool(sandboxRunner));
         return toolDispatch;
     }
 

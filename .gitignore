@@ -12,6 +12,9 @@ cp.txt
 .transcripts/
 .task_outputs/
 
+# 沙箱运行时产物：每次执行的 staging 目录与全量输出
+.sandbox/
+
 # IDE
 .idea/
 *.iml
