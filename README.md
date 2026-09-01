@@ -41,6 +41,7 @@ v3 版本的目标是给 agent 增加 ContextCompact 上下文压缩、MCP tools
   5. **响应式补救**：API 报 `prompt_too_long` 时保留最近 5 条、摘要更早历史，重试一次。
   策略 1–3 零额外 API 调用且全部可从磁盘恢复；模型还可用 `compact` 工具在阶段结束时主动请求压缩（等整批结果入史后执行摘要）。
 - **单进程模拟 MCP tools** — 模型调 `connect_mcp` 连接 server，`McpClient` 充当 tools/list 与 tools/call 的进程内替身；`McpRegistry` 把工具以 `mcp__{server}__{tool}` 前缀登记进分发表并刷新 client 的 tools 数组，下一轮请求即可调用。授权只认宿主侧策略表，server 自标的 `readOnlyHint` 不作为依据，未配置默认需用户审批。
+- **长任务放后台** — 后台线程执行命令，后续轮次收集完成结果。
 - **代码沙箱** — 新增 `run_code` 工具，把代码放进一次性容器执行，以机制隔离宿主风险：无网络、根文件系统只读、仅挂载本次运行的临时目录、非特权用户、资源限额与双层超时；容器不继承宿主环境变量，密钥进不了沙箱。权限管线靠用户审批（策略），沙箱靠机制保证出不去——隔离代替审批，因此免审批。需本机 Docker，支持 Python、Node.js、Bash。
 
 ## v4（未完成）
