@@ -8,6 +8,10 @@ dependency-reduced-pom.xml
 # 依赖 classpath 缓存
 cp.txt
 
+# s08 运行时产物：压缩留档与大结果转存
+.transcripts/
+.task_outputs/
+
 # IDE
 .idea/
 *.iml

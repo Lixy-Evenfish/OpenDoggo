@@ -35,6 +35,10 @@ public final class AnthropicClient implements ModelClient {
 
     private static final int MAX_TOKENS = 48000;
 
+    // s08 需求2：摘要调用的输出上限
+    // （参考实现 summarize_history 的 max_tokens=2000）。
+    private static final int SUMMARIZE_MAX_TOKENS = 2_000;
+
     private static final ObjectMapper MAPPER =
             new ObjectMapper();
 
@@ -90,15 +94,57 @@ public final class AnthropicClient implements ModelClient {
                 "messages cannot be null"
         );
 
+        HttpResponse<String> response =
+                post(buildRequestBody(messages));
+
+        return parseResponse(response.body());
+    }
+
+    /**
+     * s08 需求2：历史摘要专用调用——
+     * 不带 tools、max_tokens=2000；system 用
+     * 构造期固化的提示词（摘要专用实例的
+     * systemPrompt 即摘要提示词）。
+     * 返回拼接、去空白后的纯文本摘要。
+     */
+    public String summarize(String conversationJson)
+            throws IOException, InterruptedException {
+
+        Objects.requireNonNull(
+                conversationJson,
+                "conversationJson cannot be null"
+        );
+
+        ObjectNode body = MAPPER.createObjectNode();
+        body.put("model", modelId);
+        body.put("max_tokens", SUMMARIZE_MAX_TOKENS);
+        body.put("system", systemPrompt);
+
+        ObjectNode node =
+                body.putArray("messages").addObject();
+        node.put("role", "user");
+        node.put("content", conversationJson);
+
+        HttpResponse<String> response = post(body);
+
+        return parseResponse(response.body())
+                .text()
+                .strip();
+    }
+
+    /**
+     * 发送请求体并统一处理非 2xx。
+     */
+    private HttpResponse<String> post(ObjectNode body)
+            throws IOException, InterruptedException {
+
         HttpRequest request = HttpRequest.newBuilder(endpoint)
                 .timeout(Duration.ofSeconds(300))
                 .header("content-type", "application/json")
                 .header("x-api-key", apiKey)
                 .header("anthropic-version", API_VERSION)
                 .POST(HttpRequest.BodyPublishers.ofString(
-                        MAPPER.writeValueAsString(
-                                buildRequestBody(messages)
-                        ),
+                        MAPPER.writeValueAsString(body),
                         StandardCharsets.UTF_8
                 ))
                 .build();
@@ -119,7 +165,7 @@ public final class AnthropicClient implements ModelClient {
             );
         }
 
-        return parseResponse(response.body());
+        return response;
     }
 
     /**

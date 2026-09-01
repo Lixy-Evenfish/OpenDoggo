@@ -54,8 +54,10 @@ public final class TaskTool implements ToolHandler {
         subMessages.add(Message.user(prompt));
 
         try {
+            // s08 需求2：子任务 prompt 作为 activeRequest 随行
+            // ——子循环的压缩/摘要都由它保留本轮请求。
             String text =
-                    subAgentLoop.run(subMessages);
+                    subAgentLoop.run(subMessages, prompt);
 
             return text == null || text.isBlank()
                     ? "(no summary)"

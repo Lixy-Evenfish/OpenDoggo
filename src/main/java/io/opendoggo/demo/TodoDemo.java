@@ -131,7 +131,7 @@ public final class TodoDemo {
                 model,
                 hooks,
                 dispatch
-        ).run(history);
+        ).run(history, "帮我重构 example/hello.py");
 
         System.out.println();
         System.out.println("模型最终回复: " + answer);

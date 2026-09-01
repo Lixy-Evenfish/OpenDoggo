@@ -1,12 +1,10 @@
 # OpenDoggo
 
-南大软院推免项目，开源 harness。
-
-Java 实现的最小 AI coding agent：agent loop、多工具、权限管线、hooks。
+南大软院推免项目，开源 harness，Java 实现的最小 AI coding agent。
 
 ## v1
 
-当前版本实现了 agent loop 的核心闭环：
+v1 版本的目标是初步实现 agent loop 的核心闭环，完成基本的工具调度和权限控制：
 
 ```
 模型 -> 工具调用 -> 执行 -> 结果回灌 -> 模型 -> ... -> 无工具调用则结束
@@ -19,16 +17,29 @@ Java 实现的最小 AI coding agent：agent loop、多工具、权限管线、h
 - **五种具体工具** — `bash` / `read_file` / `write_file` / `edit_file` / `glob`，覆盖命令执行、读、写、精确编辑与文件查找（详见下文[工具](#工具)一节）
 - **权限控制与错误回退** — 最基础的工具权限控制：执行前依次过硬拒绝表、规则匹配、用户审批三道闸门（详见下文[权限](#权限)一节）；单轮失败时回滚历史，避免残留消息污染后续请求
 
-## v2（进行中）
+## v2 
 
-v2 的主线是让 agent loop 成为稳定内核,并扩展其他刚需功能：扩展点以 hook 形式挂在循环外，新增能力只注册 hook，循环代码不再改动。
+v2 版本的目标是引入循环钩子机制让 agent loop 成为稳定内核，并拓展实现 TodoWrite 计划机制、SubAgent 任务委派、Skill 技能加载这 3 个常见的工具。
 
-功能范围：
+新增功能：
 
-- **Hooks** — Agent loop 引入 hook 与 trigger 机制，在 4 个关键位置（`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`）设置挂载点，`AgentLoop` 的代码就此固定，后续扩展只需在 `Main` 注册 hook（权限、横幅、预览已挂上，示例 hook 补全中）
-- **TodoWrite**— 计划工具，让 agent 显式维护任务清单
-- **SubAgent**— 子 agent，允主agent通过调用工具的方法，把独立子任务委派出去
-- **Skill** — 按需知识加载：启动时扫描 `skills/` 把技能目录（名称+描述）写进 system prompt，模型判断相关时经 `load_skill` 工具取回完整 `SKILL.md`（详见下文[技能](#技能)一节）
+- **Hooks循环钩子** — Agent loop 引入 hook 和 trigger ，在 4 个关键位置（`UserPromptSubmit` / `PreToolUse` / `PostToolUse` / `Stop`）设置挂载点，`AgentLoop` 的代码就此固定，后续扩展只需在 `Main` 注册 hook（权限、横幅、预览已挂上，示例 hook 补全中）
+- **TodoWrite计划机制**— 在多步实现的复杂任务中，引导 LLM 显式维护任务清单，防止 LLM 中途跑偏
+- **SubAgent任务委派**— 允许 LLM 通过调用工具的方法，把独立子任务委派给 subagent ，使得上下文更干净
+- **Skill技能加载** — 按需知识加载，启动时扫描 `skills/` 把技能目录（名称+描述）写进 system prompt，模型判断相关时经 `load_skill` 工具取回完整 `SKILL.md`（详见下文[技能](#技能)一节），避免一次性给出过长 prompt ，缩短上下文。
+
+## v3
+
+v3 版本的目标是给 agent 增加 ContextCompact 上下文压缩、MCP tool 这 2 个进阶级的功能。
+
+新增功能：
+- **ContextCompact上下文压缩** —
+- **MCP tools** —
+- **代码沙箱** -
+
+## v4（未完成）
+
+v4 版本的目标是借助 AI 的帮助给 agent 设计TUI
 
 ## 环境要求
 
