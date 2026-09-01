@@ -63,6 +63,9 @@ public final class PermissionChecker {
     private final Path workingDirectory;
     private final ApprovalPrompt approvalPrompt;
 
+    /** s14：MCP 外部工具的宿主侧授权策略源。 */
+    private final McpToolPolicy mcpPolicy;
+
     private final List<Rule> rules = List.of(
             new Rule(
                     Set.of(
@@ -93,7 +96,8 @@ public final class PermissionChecker {
 
     public PermissionChecker(
             Path workingDirectory,
-            ApprovalPrompt approvalPrompt
+            ApprovalPrompt approvalPrompt,
+            McpToolPolicy mcpPolicy
     ) {
         this.workingDirectory =
                 Objects.requireNonNull(
@@ -107,6 +111,12 @@ public final class PermissionChecker {
                 Objects.requireNonNull(
                         approvalPrompt,
                         "approvalPrompt cannot be null"
+                );
+
+        this.mcpPolicy =
+                Objects.requireNonNull(
+                        mcpPolicy,
+                        "mcpPolicy cannot be null"
                 );
     }
 
@@ -146,6 +156,20 @@ public final class PermissionChecker {
                         ? null
                         : "Permission denied by user";
             }
+        }
+
+        // 闸门 2 + 3（s14）：MCP 外部工具按宿主策略——
+        // 免审批名单之外（含未配置的）一律用户确认；
+        // server 的自我标注（readOnlyHint 等）不算授权。
+        if (toolCall.name().startsWith("mcp__")
+                && !mcpPolicy.isAllowed(toolCall.name())) {
+            return approvalPrompt.ask(
+                    toolCall.name(),
+                    input,
+                    "External MCP tool"
+            )
+                    ? null
+                    : "Permission denied by user";
         }
 
         return null;

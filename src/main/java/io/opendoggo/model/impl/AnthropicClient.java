@@ -84,6 +84,18 @@ public final class AnthropicClient implements ModelClient {
                 .build();
     }
 
+    /**
+     * s14：连接 MCP server 后刷新工具定义。
+     * 连接是低频事件，参考实现的"每轮重组工具池"
+     * 在 Java 端落成"connect 时刷新一次"。
+     */
+    public void updateTools(JsonNode toolDefinitions) {
+        this.toolDefinitions = Objects.requireNonNull(
+                toolDefinitions,
+                "toolDefinitions cannot be null"
+        );
+    }
+
     @Override
     public ModelResponse createMessage(
             List<Message> messages

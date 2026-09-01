@@ -4,6 +4,7 @@ import io.opendoggo.agent.AgentLoop;
 import io.opendoggo.compaction.ContextCompactor;
 import io.opendoggo.environment.Env;
 import io.opendoggo.hook.HookRunner;
+import io.opendoggo.mcp.McpRegistry;
 import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.impl.AnthropicClient;
@@ -13,6 +14,7 @@ import io.opendoggo.skill.SkillLoader;
 import io.opendoggo.tool.ToolDispatch;
 import io.opendoggo.tool.ToolHandler;
 import io.opendoggo.tool.impl.CompactTool;
+import io.opendoggo.tool.impl.ConnectMcpTool;
 import io.opendoggo.tool.impl.EditFileTool;
 import io.opendoggo.tool.impl.GlobTool;
 import io.opendoggo.tool.impl.LoadSkillTool;
@@ -128,12 +130,19 @@ public final class Main {
                         + "\n\nUse load_skill to read "
                         + "the full instructions "
                         + "when a skill applies.";
+        // s14：连接型工具引导（参考实现 BASE_SYSTEM 的 MCP 句）。
+        String mcp =
+                "Use built-in and connected MCP "
+                        + "tools to solve tasks. "
+                        + "Call connect_mcp before "
+                        + "using a server.";
 
         String systemPrompt = identity
                 + " " + planning
                 + " " + delegation
                 + " " + approval
                 + " " + compactionSafety
+                + " " + mcp
                 + "\n\n" + skills;
         // s06：reader 与权限先于工具装配——
         // 父/子两个 hookRunner 都依赖 permissionChecker。
@@ -144,11 +153,18 @@ public final class Main {
                 )
         );
 
-        // 闸门 3 的控制台实现：默认拒绝。
+        // s14：MCP 注册表——先于权限装配，
+        // 它是 mcp__ 工具宿主侧授权策略的数据源；
+        // 分发表与 client 的 tools 刷新在父循环装配完成后 attach。
+        McpRegistry mcpRegistry = new McpRegistry();
+
+        // 闸门 3 的控制台实现：默认拒绝；
+        // mcp__ 前缀工具的策略查询交给注册表。
         PermissionChecker permissionChecker =
                 new PermissionChecker(
                         workingDirectory,
-                        new ConsoleApprovalPrompt(reader)
+                        new ConsoleApprovalPrompt(reader),
+                        mcpRegistry::isAllowed
                 );
 
         HookRunner hookRunner = initHooks(
@@ -232,15 +248,23 @@ public final class Main {
         ToolDispatch toolDispatch = initTools(
                 workingDirectory,
                 new TaskTool(subAgentLoop),
-                skillLoader
+                skillLoader,
+                mcpRegistry
         );
         ArrayNode toolDefinitions = toolDispatch.toolDefinitions();
-        ModelClient modelClient = new AnthropicClient(
+        AnthropicClient modelClient = new AnthropicClient(
                 baseUrl,
                 apiKey,
                 modelId,
                 systemPrompt,
                 toolDefinitions
+        );
+
+        // s14：MCP 工具在 connect 时登记进父分发表，
+        // 并刷新父 client 的 tools 数组。
+        mcpRegistry.attach(
+                toolDispatch,
+                modelClient::updateTools
         );
 
         AgentLoop agentLoop = new AgentLoop(
@@ -277,14 +301,17 @@ public final class Main {
      * + s08 的 compact（第九个，仅父循环——
      * "仅定义"注册：让 tools 数组带上定义，
      * 调用在 AgentLoop 里 hooks 之前拦截，
-     * execute 是走不到的兜底）。
+     * execute 是走不到的兜底）
+     * + s14 的 connect_mcp（第十个，仅父循环——
+     * 连接/发现都在 McpRegistry，子代理保持五基础工具口径）。
      * 新增工具 = 实现 ToolHandler 后在这里登记一行，
      * tools 数组由注册表自动生成。
      */
     private static ToolDispatch initTools(
             Path workingDirectory,
             ToolHandler taskTool,
-            SkillLoader skillLoader
+            SkillLoader skillLoader,
+            McpRegistry mcpRegistry
     ) {
         ToolDispatch toolDispatch =
                 initBaseTools(workingDirectory);
@@ -292,6 +319,7 @@ public final class Main {
         toolDispatch.register(taskTool);
         toolDispatch.register(new LoadSkillTool(skillLoader));
         toolDispatch.register(new CompactTool());
+        toolDispatch.register(new ConnectMcpTool(mcpRegistry));
         return toolDispatch;
     }
 

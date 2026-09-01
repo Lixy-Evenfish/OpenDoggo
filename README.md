@@ -12,14 +12,14 @@ v1 版本的目标是初步实现 agent loop 的核心闭环，完成基本的�
 
 功能范围：
 
-- **Agent Loop** — 核心循环支持 Anthropic Messages 格式的 AI 调用（仅 JDK `HttpClient`，无 SDK 依赖）：模型请求工具就继续循环，不请求就返回最终回答，上限 50 轮；单次回复中的多个 tool_use 依次执行后一并回传。外层是命令行 REPL，多轮对话，历史驻留内存
+- **Agent Loop主循环** — 核心循环支持 Anthropic Messages 格式的 AI 调用（仅 JDK `HttpClient`，无 SDK 依赖）：模型请求工具就继续循环，不请求就返回最终回答，上限 50 轮；单次回复中的多个 tool_use 依次执行后一并回传。外层是命令行 REPL，多轮对话，历史驻留内存
 - **工具注册与调度** — 工具实现统一的 `ToolHandler` 接口、注册进 `ToolDispatch` 按名分发；发给模型的 `tools` 数组由注册表自动生成，新增工具不需要改客户端代码
 - **五种具体工具** — `bash` / `read_file` / `write_file` / `edit_file` / `glob`，覆盖命令执行、读、写、精确编辑与文件查找（详见下文[工具](#工具)一节）
 - **权限控制与错误回退** — 最基础的工具权限控制：执行前依次过硬拒绝表、规则匹配、用户审批三道闸门（详见下文[权限](#权限)一节）；单轮失败时回滚历史，避免残留消息污染后续请求
 
 ## v2 
 
-v2 版本的目标是引入循环钩子机制让 agent loop 成为稳定内核，并拓展实现 TodoWrite 计划机制、SubAgent 任务委派、Skill 技能加载这 3 个常见的工具。
+v2 版本的目标是引入循环钩子机制让 agent loop 成为稳定内核，并实现 TodoWrite 计划机制、SubAgent 任务委派、Skill 技能加载这 3 个常见的工具。
 
 新增功能：
 
@@ -30,16 +30,23 @@ v2 版本的目标是引入循环钩子机制让 agent loop 成为稳定内核�
 
 ## v3
 
-v3 版本的目标是给 agent 增加 ContextCompact 上下文压缩、MCP tool 这 2 个进阶级的功能。
+v3 版本的目标是给 agent 增加 ContextCompact 上下文压缩、MCP tools 这 2 个进阶级的拓展。
 
 新增功能：
-- **ContextCompact上下文压缩** —
-- **MCP tools** —
-- **代码沙箱** -
+- **ContextCompact上下文压缩** — 上下文总会满，先整理、再总结。每轮模型调用前运行压缩管线，五个策略按成本递进：
+  1. **大结果落盘**：最新一批工具结果总量超 200k 时，超 30k 的结果全文写入 `.task_outputs/tool-results/`，上下文只留路径 + 2,000 字符预览；
+  2. **消息归档**：历史超 50 条时保留头 3 + 尾 46，中段全量写入 `.transcripts/` 并原位换成归档标记（切点保护 tool_use/tool_result 配对）；
+  3. **旧结果缩短**：字符估算超 50k（目标 40k）时，已读旧结果保留最近 3 条、更早的换成可恢复路径引用，未读大结果换 1,000 字符预览；
+  4. **历史摘要**：整理后仍超限，花一次专用模型调用生成事实摘要，历史替换为单条 `[Compacted]` 消息（当前请求与摘要分区，防提示注入）；
+  5. **响应式补救**：API 报 `prompt_too_long` 时保留最近 5 条、摘要更早历史，重试一次。
+  策略 1–3 零额外 API 调用且全部可从磁盘恢复；模型还可用 `compact` 工具在阶段结束时主动请求压缩（等整批结果入史后执行摘要）。
+- **单进程模拟 MCP tools** — 模型调 `connect_mcp` 连接 server，`McpClient` 充当 tools/list 与 tools/call 的进程内替身；`McpRegistry` 把工具以 `mcp__{server}__{tool}` 前缀登记进分发表并刷新 client 的 tools 数组，下一轮请求即可调用。授权只认宿主侧策略表，server 自标的 `readOnlyHint` 不作为依据，未配置默认需用户审批。
+- **代码沙箱** - 
 
 ## v4（未完成）
 
-v4 版本的目标是借助 AI 的帮助给 agent 设计TUI
+v4 版本的目标是依靠 AI 大人的帮助给 agent 设计 TUI 界面，并支持 "/" 命令系统。
+
 
 ## 环境要求
 

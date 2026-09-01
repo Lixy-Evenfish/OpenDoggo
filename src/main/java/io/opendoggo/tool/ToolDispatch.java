@@ -16,6 +16,11 @@ public class ToolDispatch {
         handlers.put(handler.name(), handler);
     }
 
+    /** s14：注册名查询——MCP 前缀撞名检测用。 */
+    public boolean hasTool(String name) {
+        return handlers.containsKey(name);
+    }
+
     public String execute(ContentBlock toolCall){
         if (toolCall == null) {
             return "Error: Empty tool call";
