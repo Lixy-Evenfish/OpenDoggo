@@ -1,5 +1,6 @@
 package io.opendoggo.agent;
 
+import io.opendoggo.background.BackgroundManager;
 import io.opendoggo.compaction.ContextCompactor;
 import io.opendoggo.hook.HookRunner;
 import io.opendoggo.model.ContentBlock;
@@ -14,6 +15,9 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+
+import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 
 /**
  * S1 的核心 Agent Loop。
@@ -63,6 +67,12 @@ public final class AgentLoop {
     // null 时关闭压缩（demo / 测试场景）。
     private final ContextCompactor compactor;
 
+    // s11：后台任务管理器——null 时关闭后台执行
+    // （demo / 测试场景）。非 null 时 run_in_background
+    // 的 bash 调用立即回占位结果，完成结果在后续
+    // 轮次模型调用前以通知注入。
+    private final BackgroundManager background;
+
     // s08 需求2：prompt_too_long 补救的最大重试次数。
     private static final int MAX_REACTIVE_RETRIES = 1;
 
@@ -78,6 +88,7 @@ public final class AgentLoop {
                 MAX_TOOL_ROUNDS,
                 null,
                 true,
+                null,
                 null
         );
     }
@@ -99,7 +110,31 @@ public final class AgentLoop {
                 MAX_TOOL_ROUNDS,
                 null,
                 true,
-                compactor
+                compactor,
+                null
+        );
+    }
+
+    /**
+     * s11：父循环便捷构造——压缩器 + 后台管理器，
+     * 其余保持默认（50 轮、超限抛异常、todo 催更开）。
+     */
+    public AgentLoop(
+            ModelClient modelClient,
+            HookRunner hookRunner,
+            ToolDispatch toolDispatch,
+            ContextCompactor compactor,
+            BackgroundManager background
+    ) {
+        this(
+                modelClient,
+                hookRunner,
+                toolDispatch,
+                MAX_TOOL_ROUNDS,
+                null,
+                true,
+                compactor,
+                background
         );
     }
 
@@ -122,6 +157,36 @@ public final class AgentLoop {
             boolean todoReminderEnabled,
             ContextCompactor compactor
     ) {
+        this(
+                modelClient,
+                hookRunner,
+                toolDispatch,
+                maxToolRounds,
+                overrunResult,
+                todoReminderEnabled,
+                compactor,
+                null
+        );
+    }
+
+    /**
+     * s11 完整构造器：在 s06/s08 参数之上增加
+     * background（后台任务管理器，null 关闭）。
+     *
+     * 父/子循环共用同一个 BackgroundManager 实例
+     * （与压缩器同口径）——它是宿主级登记处，
+     * 完成通知由先到达下一轮模型调用的循环收集。
+     */
+    public AgentLoop(
+            ModelClient modelClient,
+            HookRunner hookRunner,
+            ToolDispatch toolDispatch,
+            int maxToolRounds,
+            String overrunResult,
+            boolean todoReminderEnabled,
+            ContextCompactor compactor,
+            BackgroundManager background
+    ) {
         this.modelClient = Objects.requireNonNull(
                 modelClient,
                 "modelClient cannot be null"
@@ -141,6 +206,7 @@ public final class AgentLoop {
         this.overrunResult = overrunResult;
         this.todoReminderEnabled = todoReminderEnabled;
         this.compactor = compactor;
+        this.background = background;
     }
 
     /**
@@ -172,6 +238,13 @@ public final class AgentLoop {
             // （确定性整理 + 仍超限时的历史摘要）。
             if (compactor != null) {
                 compactor.prepare(messages, activeRequest);
+            }
+
+            // s11：模型调用前收集已完成的后台任务，
+            // 以通知并入最近一条 user 消息——
+            // 后台结果不主动唤醒循环，只搭下一班车。
+            if (background != null) {
+                injectBackgroundResults(messages);
             }
 
             // 将当前完整历史发送给模型。
@@ -280,7 +353,34 @@ public final class AgentLoop {
                 String output;
 
                 try {
-                    output = toolDispatch.execute(toolCall);
+                    // s11：显式 run_in_background 的 bash
+                    // 进后台线程——此刻 PreToolUse（权限）
+                    // 已经放行，立即回带 bg_id 的占位结果，
+                    // 命令的真实结果留给后续轮次收集；
+                    // 其余调用照常同步执行。
+                    if (background != null
+                            && background.isBackgroundRequest(
+                            toolCall.name(),
+                            toolCall.input()
+                    )) {
+                        String taskId = background.start(
+                                toolCall.name(),
+                                toolCall.id(),
+                                toolCall.input()
+                        );
+
+                        output = "[Background task "
+                                + taskId
+                                + " started] The result "
+                                + "will be collected on a "
+                                + "later turn.";
+
+                    } else {
+                        output = toolDispatch.execute(
+                                toolCall
+                        );
+                    }
+
                 } catch (Exception exception) {
                     output = "Error: " + exception.getMessage();
                 }
@@ -340,6 +440,74 @@ public final class AgentLoop {
                         + maxToolRounds
                         + " tool rounds"
         );
+    }
+
+    /**
+     * s11：把已完成的后台结果并入消息列表
+     * （对应参考实现 inject_background_results）。
+     *
+     * 通知以 type=text 块加入最近一条 user 消息：
+     * 数组内容原地追加（工具结果批次搭车，同
+     * todo 提醒的 rider 做法）；纯文本内容升级为
+     * 块数组（本轮 query + 通知同条消息）；
+     * 最近一条不是 user 时（上轮以 assistant 收尾）
+     * 另起一条 user 消息。通知是独立文本事件，
+     * 不复用 tool_use_id，一个 tool_use 仍然只
+     * 对应一个 tool_result。
+     *
+     * @return 本次注入的通知条数
+     */
+    private int injectBackgroundResults(
+            List<Message> messages
+    ) {
+        List<String> notifications = background.collect();
+
+        if (notifications.isEmpty()) {
+            return 0;
+        }
+
+        ArrayNode blocks =
+                JsonNodeFactory.instance.arrayNode();
+
+        for (String notification : notifications) {
+            blocks.addObject()
+                    .put("type", "text")
+                    .put("text", notification);
+        }
+
+        if (!messages.isEmpty()
+                && "user".equals(messages.get(
+                messages.size() - 1).role())) {
+
+            Message last = messages.get(
+                    messages.size() - 1
+            );
+
+            if (last.content().isArray()) {
+                ((ArrayNode) last.content())
+                        .addAll(blocks);
+
+            } else {
+                ArrayNode merged =
+                        JsonNodeFactory.instance.arrayNode();
+
+                merged.addObject()
+                        .put("type", "text")
+                        .put("text",
+                                last.content().asText());
+                merged.addAll(blocks);
+
+                messages.set(
+                        messages.size() - 1,
+                        new Message("user", merged)
+                );
+            }
+
+        } else {
+            messages.add(new Message("user", blocks));
+        }
+
+        return notifications.size();
     }
 
 }

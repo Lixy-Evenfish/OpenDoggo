@@ -4,11 +4,14 @@ import java.io.IOException;
 import java.nio.charset.Charset;
 import java.nio.file.Path;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
 import java.util.Objects;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -19,10 +22,27 @@ import io.opendoggo.tool.ToolHandler;
 
 /**
  * 在指定工作目录中执行 Shell 命令。
+ *
+ * s11：schema 增加 run_in_background 参数
+ * （是否进后台由 BackgroundManager 判断，
+ * 本工具只负责同步执行一条命令）；
+ * run(command) 是可被后台线程复用的执行核心，
+ * 返回输出与退出码；在跑进程登记进静态集合，
+ * JVM 退出时统一终止（对应参考实现的
+ * _shell_processes + atexit 生命周期清理）。
  */
 public final class ShellTool implements ToolHandler {
 
     private static final int MAX_OUTPUT_LENGTH = 50000;
+
+    /**
+     * s11：当前在跑的全部命令进程（跨实例共享——
+     * 父/子/后台命令都登记），对应参考实现的
+     * 模块级 _shell_processes；JVM 正常退出时
+     * 由 destroyAllRunning 统一停止。
+     */
+    private static final Set<Process> RUNNING_PROCESSES =
+            ConcurrentHashMap.newKeySet();
 
     private final Path workingDirectory;
     private final Duration timeout;
@@ -57,9 +77,13 @@ public final class ShellTool implements ToolHandler {
                 JsonNodeFactory.instance.objectNode();
         schema.put("type", "object");
 
-        schema.putObject("properties")
-                .putObject("command")
+        // s11：run_in_background 显式请求后台执行；
+        // 非必填——缺省仍走同步路径。
+        ObjectNode properties = schema.putObject("properties");
+        properties.putObject("command")
                 .put("type", "string");
+        properties.putObject("run_in_background")
+                .put("type", "boolean");
 
         schema.putArray("required").add("command");
         return schema;
@@ -76,15 +100,36 @@ public final class ShellTool implements ToolHandler {
             return "Error: command cannot be empty";
         }
 
+        return run(command).output();
+    }
+
+    /**
+     * s11：一次命令执行的产物——
+     * output 是与 execute 一致的整理后输出；
+     * exitCode 是进程退出码，超时/启动失败/中断时
+     * 为 null（后台任务据此标记 failed）。
+     */
+    public record Outcome(String output, Integer exitCode) {
+    }
+
+    /**
+     * s11：可复用的执行核心——同步与后台共用
+     * 同一条路径（超时、输出上限、进程清理），
+     * 对应参考实现BackgroundManager 复用的
+     * _run_bash_process。
+     */
+    public Outcome run(String command) {
         Process process = null;
         try {
-            
+
             process = new ProcessBuilder(
                     createShellCommand(command)
             )
                     .directory(workingDirectory.toFile())
                     .redirectErrorStream(true)
                     .start();
+
+            RUNNING_PROCESSES.add(process);
 
             Process runningProcess = process;
 
@@ -110,9 +155,12 @@ public final class ShellTool implements ToolHandler {
             if (!finished) {
                 destroyProcessTree(process);
 
-                return "Error: Timeout ("
-                        + timeout.toSeconds()
-                        + "s)";
+                return new Outcome(
+                        "Error: Timeout ("
+                                + timeout.toSeconds()
+                                + "s)",
+                        null
+                );
             }
 
             String output = new String(
@@ -121,29 +169,59 @@ public final class ShellTool implements ToolHandler {
             ).strip();
 
             if (output.isEmpty()) {
-                return "(no output)";
+                output = "(no output)";
             }
 
-            return abbreviate(
-                    output,
-                    MAX_OUTPUT_LENGTH
+            return new Outcome(
+                    abbreviate(output, MAX_OUTPUT_LENGTH),
+                    process.exitValue()
             );
 
         } catch (IOException exception) {
-            return "Error: " + exception.getMessage();
+            return new Outcome(
+                    "Error: " + exception.getMessage(),
+                    null
+            );
 
         } catch (InterruptedException exception) {
             Thread.currentThread().interrupt();
-            return "Error: Command interrupted";
+            return new Outcome(
+                    "Error: Command interrupted",
+                    null
+            );
 
         } catch (CompletionException exception) {
-            return "Error: Unable to read command output";
+            return new Outcome(
+                    "Error: Unable to read command output",
+                    null
+            );
 
         } finally {
-            if (process != null && process.isAlive()) {
-                destroyProcessTree(process);
+            if (process != null) {
+                RUNNING_PROCESSES.remove(process);
+
+                if (process.isAlive()) {
+                    destroyProcessTree(process);
+                }
             }
         }
+    }
+
+    /**
+     * s11：JVM 退出前停止全部在跑命令
+     * （参考实现的 atexit/SIGTERM 生命周期清理——
+     * 这是清理，不是沙箱）。
+     */
+    public static void destroyAllRunning() {
+        for (Process process
+                : new ArrayList<>(RUNNING_PROCESSES)) {
+            destroyProcessTree(process);
+        }
+    }
+
+    /** s11：当前在跑命令数（demo 等待进程登记用）。 */
+    public static int runningCount() {
+        return RUNNING_PROCESSES.size();
     }
 
     /**
@@ -176,7 +254,7 @@ public final class ShellTool implements ToolHandler {
     /**
      * 超时或退出时终止命令及其子进程。
      */
-    private void destroyProcessTree(
+    private static void destroyProcessTree(
             Process process
     ) {
         process.descendants()

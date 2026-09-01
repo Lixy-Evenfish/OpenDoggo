@@ -1,207 +1,178 @@
-# s14: MCP Tools — Discover and Invoke External Tools
+# s11: Background Tasks — Slow Operations Go to the Background
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-[s04](../s04_hooks/) → `s14` → [s15](../s15_integrated_harness/) → s16 → s17
+s01 → ... → s09 → s10 → `s11` → [s12](../s12_cron_scheduler/) → s13 → ... → s16 → s17
 
-> **Harness layer**: MCP Tools — connect to services, discover tools, and add them to the agent loop.
+> *"Slow operations go to the background, the Agent Loop continues"* — Background threads run commands, and later turns collect completed results.
+>
+> **Harness Layer**: Background — Async execution, doesn't block the main loop.
 
 ---
 
 ## The Problem
 
-The base tools in earlier chapters are written directly in `code.py`. We could integrate a documentation system and deployment platform by adding `search_docs`, `deploy_status`, and `trigger_deploy`, but every service would require another set of tool definitions, parameter schemas, and call handlers.
+Reading a file or running `git status` usually returns quickly, so synchronous execution causes little noticeable delay. Installing dependencies, running a full test suite, or building a project can take several minutes. Until the command returns, the Harness cannot process the next tool call in the current response or start the next model turn.
 
-MCP separates those responsibilities. A server provides a tool list and invocation endpoint. The harness connects to it, assigns model-facing names, applies permission checks, and gives the discovered tools to the model.
+If later work does not depend on that command, there is no need to block it. For example, after starting a full test suite, the Agent could inspect documentation or organize other files while the tests run.
+
+S11 addresses this by running slow Bash commands in the background, allowing the Agent Loop to continue and collect completed results on a later turn.
 
 ---
 
 ## The Solution
 
-![MCP Architecture](images/mcp-architecture.en.svg)
+![Background Tasks Overview](images/background-tasks-overview.en.svg)
 
-This chapter starts from s04's five base tools and hooks, then adds three parts:
+This chapter sends slow operations to background threads. The current tool call first returns a placeholder `tool_result`, allowing the Agent Loop to continue. At the start of a later turn, completed results are collected and added to the conversation as notifications.
 
-- `MCPClient` stores the tool definitions and call handlers returned by a server.
-- `connect_mcp` connects to one server and obtains its tool list.
-- `assemble_tool_pool` combines the base tools with tools from every connected server.
+Sync vs Background:
 
-The `docs` and `deploy` servers are in-process stand-ins for `tools/list`, `tools/call`, and a dynamic tool pool. This chapter does not implement a real MCP transport.
+| | Sync (s04) | Background (s11) |
+|---|---|---|
+| Slow operations | Current tool call blocks | Background thread executes |
+| Agent Loop | Waits for the command to return | Continues after the placeholder result |
+| Result | Returned after the command finishes | Returns `bg_id` first; collects the result on a later turn |
+| Decision criteria | — | bash `run_in_background` parameter |
 
 ---
 
 ## How It Works
 
-### 1. The base agent loop stays the same
+### should_run_background: Explicit Request
 
-Before each model call, the harness assembles the current tool pool:
+The model requests background execution through the bash tool's `run_in_background` parameter. Only bash calls with the parameter explicitly set to `true` enter this path. Other calls still run synchronously.
 
 ```python
-def agent_loop(messages: list):
-    while True:
-        tools, handlers = assemble_tool_pool()
-        response = client.messages.create(
-            model=MODEL,
-            system=assemble_system_prompt(),
-            messages=messages,
-            tools=tools,
-            max_tokens=8000,
-        )
+def should_run_background(tool_name: str, tool_input: dict) -> bool:
+    return (
+        tool_name == "bash"
+        and tool_input.get("run_in_background") is True
+    )
+```
+
+The Harness no longer guesses from keywords such as `install`, `build`, or `test`. The tool call chooses the execution mode explicitly.
+
+### BackgroundManager: Background Execution and Lifecycle
+
+`BackgroundManager` owns task state and the completion queue. `start()` registers a task, starts a daemon thread, and returns `bg_id` immediately:
+
+```python
+class BackgroundManager:
+    def __init__(self):
+        self.tasks = {}
+        self.results = {}
+        self._ready = []
+        self._lock = threading.Lock()
+
+    def start(self, block) -> str:
+        # Register task, then run _run() in a daemon thread.
         ...
+
+    def _run(self, task_id: str, command: str):
+        output, exit_code = _run_bash_process(command)
+        status = "completed" if exit_code == 0 else "failed"
+        with self._lock:
+            self.tasks[task_id]["status"] = status
+            self.results[task_id] = _format_bash_result(output, exit_code)
+            self._ready.append(task_id)
 ```
 
-After a new server connects, the next `assemble_tool_pool()` call adds its tools to the model input. Tool results are still appended to messages as `tool_result` blocks.
+A non-zero exit code or worker exception becomes `failed`. The shell starts in its own process group. When the command finishes, times out, or the Agent exits through the normal or `SIGTERM` path, the runtime stops that original group. This is lifecycle cleanup, not a sandbox: a process that creates another session can leave the group.
 
-### 2. MCPClient stores discovery results and call handlers
+### collect_background_results: Notification Collection
+
+At the start of a later turn, `collect()` removes completed results from the queue and formats them as `<task_notification>` messages:
 
 ```python
-class MCPClient:
-    def register(self, tool_defs, handlers):
-        self.tools = list(tool_defs)
-        self._handlers = dict(handlers)
-
-    def call_tool(self, tool_name, args):
-        handler = self._handlers.get(tool_name)
-        if not handler:
-            return f"MCP error: unknown tool '{tool_name}'"
-        try:
-            return str(handler(**args))
-        except Exception as error:
-            return f"MCP error: {type(error).__name__}: {error}"
+def collect_background_results() -> list[str]:
+    return BACKGROUND.collect()
 ```
 
-`register()` represents the discovered tool list. `call_tool()` represents the invocation boundary. Errors return to the model instead of terminating the agent loop.
+Notifications don't reuse the original `tool_use_id`. The original tool call was already answered with a placeholder `tool_result`; when the completed result is collected, it is added as an independent event in `task_notification` format. One `tool_use` still gets exactly one `tool_result`.
 
-### 3. connect_mcp only connects and discovers
+### Loop Integration
+
+Before each LLM call, the Agent Loop collects completed background results. `execute_tool()` still runs `PreToolUse` on the main thread before choosing synchronous or background execution:
 
 ```python
-def connect_mcp(name: str) -> str:
-    if name in mcp_clients:
-        return f"MCP server '{name}' already connected"
-    factory = MOCK_SERVERS.get(name)
-    if not factory:
-        return f"Unknown server '{name}'"
-    server = factory()
-    mcp_clients[name] = server
-    ...
+while True:
+    inject_background_results(messages)
+    response = client.messages.create(...)
+
+def execute_tool(block) -> str:
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked is not None:
+        return str(blocked)
+    if should_run_background(block.name, block.input):
+        task_id = start_background_task(block)
+        output = f"[Background task {task_id} started]"
+    else:
+        output = call_tool(block)
+    trigger_hooks("PostToolUse", block, output)
+    return output
 ```
 
-Initially, the model sees the five base tools and `connect_mcp`. After `connect_mcp(name="docs")`, the harness stores the docs client. The next model call also sees:
+Slow operations first return a placeholder tool_result with `bg_id`. A completed task does not wake the Agent by itself; `inject_background_results()` collects it the next time the Agent Loop runs.
 
-```text
-mcp__docs__search
-mcp__docs__get_version
+### Putting It Together
+
+```
+Turn 1:
+  LLM → bash "npm install" (run_in_background=true)
+  → start_background_task → bg_0001
+  → tool_result: "[Background task bg_0001 started]..."
+  → LLM: "OK, I'll check later. Let me also read the config."
+
+Turn 2:
+  LLM → read_file "package.json" (fast, sync)
+  → tool_result: file content
+
+Turn 3:
+  → collect bg_0001 as <task_notification>
+  → LLM sees: config file + install notification in one message
 ```
 
-### 4. Prefixes separate tools from different servers
-
-Several servers may expose `search` or `status`. The harness uses:
-
-```text
-mcp__{server}__{tool}
-```
-
-`normalize_mcp_name()` replaces characters outside the model tool-name alphabet with underscores. Tool-pool assembly also checks normalized-name collisions and the 64-character limit:
-
-```python
-prefixed = f"mcp__{safe_server}__{safe_tool}"
-if prefixed in origins:
-    raise ValueError("MCP tool name collision after normalization")
-```
-
-As a result, `docs.one/get.version` and `docs_one/get_version` cannot silently map to the same name.
-
-### 5. Tool definitions and handlers enter the pool together
-
-```python
-tools.append({
-    "name": prefixed,
-    "description": tool_def.get("description", ""),
-    "input_schema": schema,
-})
-handlers[prefixed] = (
-    lambda *, client=server, tool=raw_name, **kwargs:
-    client.call_tool(tool, kwargs)
-)
-```
-
-The model sees the prefixed name. The handler calls `MCPClient` with the server's original tool name. Default arguments capture the current client and tool so every lambda does not point to the last item in the loop.
-
-### 6. The host decides permissions
-
-An MCP server may provide `readOnlyHint` or `destructiveHint`, but those hints come from the server and are not authorization. This chapter uses a host-side policy:
-
-```python
-MCP_HOST_POLICY = {
-    ("docs", "search"): "allow",
-    ("docs", "get_version"): "allow",
-    ("deploy", "status"): "allow",
-    ("deploy", "trigger"): "confirm",
-}
-```
-
-`permission_hook()` looks up this policy using the normalized tool name. An unconfigured external tool requires confirmation by default. A description containing `readOnly` does not make a tool trusted.
-
-### 7. Input errors stay at the tool boundary
-
-The model may omit a required argument or send a field the server does not accept. Both `execute_tool()` and `MCPClient.call_tool()` catch those errors and return an error `tool_result`:
-
-```text
-MCP error: TypeError: <lambda>() missing 1 required argument: 'query'
-```
-
-The model can correct its arguments on the next turn without terminating the lesson script.
+While npm install ran in the background, the Agent Loop continued with read_file.
 
 ---
 
-## What Changed from s04
+## What s11 Adds
 
-| Component | s04 | s14 |
-|---|---|---|
-| Base tools | Five fixed tools | Unchanged |
-| Tool source | Definitions in `code.py` | Base tools plus discovered MCP tools |
-| Tool pool | Fixed `TOOLS` | Built each turn by `assemble_tool_pool()` |
-| External tool names | None | `mcp__{server}__{tool}` |
-| Permission | Shell and path checks | Adds a host-side MCP policy |
-| MCP transport | None | In-process server stand-ins demonstrate the boundary |
-
-This chapter does not carry Task, Background, Cron, Team, or Worktree. They join MCP in the s15 Integrated Harness.
+| Component | s04 Kernel | s11 |
+|-----------|-------------|-------------|
+| Execution model | All synchronous | Slow ops to background thread + notification injection |
+| bash schema | `command` | `command` + `run_in_background` |
+| New functions | — | `should_run_background`, `start_background_task`, `collect_background_results`, `inject_background_results` |
+| New types | — | `BackgroundManager` |
+| Notification format | — | `<task_notification>` (doesn't reuse tool_use_id) |
+| Loop behavior | Tools execute synchronously | Explicit background execution, completed results collected on later turns |
+| Tools | 5 | 5 (one parameter added to the bash schema) |
 
 ---
 
-## Try It Out
+## Try It
 
 ```sh
 cd learn-claude-code
-python s14_mcp_plugin/code.py
+python s11_background_tasks/code.py
 ```
 
-Enter:
+Try these prompts:
 
-```text
-Connect to the docs server, search for agent hooks, and tell me the current documentation API version.
-```
+1. `Run pip list in the background and find all Python files in this directory`
+2. `Run npm install (use run_in_background) and while waiting, read package.json`
+3. `Run a short sleep in the background, then list all Markdown files`
 
-A typical tool trace is:
-
-```text
-connect_mcp(name="docs")
-mcp__docs__search(query="agent hooks")
-mcp__docs__get_version()
-```
-
-Then enter:
-
-```text
-Connect to the deploy server and check the web service status. Do not trigger a deployment.
-```
-
-`status` runs under the host policy. `trigger` requires user confirmation.
+What to observe: After explicitly setting `run_in_background`, is the command dispatched to the background? Is a `bg_id` returned? Are completed results collected in `<task_notification>` format on a later turn?
 
 ---
 
 ## What's Next
 
-MCP is still an independent course branch here. s15 Integrated Harness combines the base tools, hooks, skills, context, memory, tasks, background work, cron, teams, and MCP in one runtime.
+Background tasks solved "slow operations don't block." But what if you want to do something on a schedule? Like "run tests every morning at 9am" or "check server status every 5 minutes."
 
-<!-- translation-sync: zh@v9, en@v9, ja@v9 -->
+s12 Cron Scheduler → Give the agent an alarm clock.
+
+
+<!-- translation-sync: zh@v7, en@v7, ja@v7 -->

@@ -1,171 +1,153 @@
-# s14: MCP Tools — 发现并调用外部工具
+# s11: Background Tasks — 慢操作放后台
 
 [English](README.md) · [中文](README.zh.md) · [日本語](README.ja.md)
 
-[s04](../s04_hooks/) → `s14` → [s15](../s15_integrated_harness/) → s16 → s17
+s01 → ... → s09 → s10 → `s11` → [s12](../s12_cron_scheduler/) → s13 → ... → s16 → s17
 
-> **Harness 层**：MCP Tools — 连接服务、发现工具，并把它们加入 Agent 的工具循环。
+> *"慢操作放后台，Agent Loop 继续运行"* — 后台线程执行命令，后续轮次收集完成结果。
+>
+> **Harness 层**: 后台 — 异步执行, 不阻塞主循环。
 
 ---
 
 ## 问题
 
-前面的基础工具都直接写在 `code.py` 里。接入文档系统和部署平台时，我们还可以继续手写 `search_docs`、`deploy_status` 和 `trigger_deploy`，但每增加一个服务，都要重新维护工具定义、参数格式和调用代码。
+读取文件或运行 `git status` 通常很快，同步执行时等待并不明显。但安装依赖、执行完整测试或构建项目可能持续几分钟。在命令返回前，Harness 无法处理当前响应中的下一个工具调用，也不能进入下一轮。
 
-MCP 把这部分拆成两个角色：server 提供工具列表和调用入口，Harness 负责连接、命名、权限检查，并把发现的工具交给模型。
+如果后续工作并不依赖这个命令，继续等待就没有必要。例如，Agent 启动完整测试后，本来还可以检查文档或整理其他文件，但同步执行会让整个 Agent Loop 停在这次 Bash 调用上。
+
+S11 要解决的问题是：让耗时的 Bash 命令在后台执行，使 Agent Loop 可以继续处理其他工作，并在后续轮次收集完成结果。
 
 ---
 
 ## 解决方案
 
-![MCP Architecture](images/mcp-architecture.svg)
+![Background Tasks Overview](images/background-tasks-overview.svg)
 
-本章从 s04 的五个基础工具和 Hooks 出发，增加三个部分：
+本章把慢操作放入后台线程。当前工具调用先返回一个占位 `tool_result`，Agent Loop 可以继续运行；后续轮次开始时再收集已经完成的结果，以通知形式加入对话。
 
-- `MCPClient` 保存 server 返回的工具定义和调用入口。
-- `connect_mcp` 连接一个 server，并取得它的工具列表。
-- `assemble_tool_pool` 把基础工具与已经连接的 MCP 工具组装到同一个工具池。
+同步 vs 后台：
 
-课程里的 `docs` 和 `deploy` 是进程内模拟 server，用来展示 `tools/list`、`tools/call` 和动态工具池。真实 MCP transport 不在本章实现。
+| | 同步 (s04) | 后台 (s11) |
+|---|---|---|
+| 慢操作 | 当前工具调用被阻塞 | 后台线程执行 |
+| Agent Loop | 等待命令返回 | 收到占位结果后继续运行 |
+| 结果 | 命令结束后返回 | 先返回 `bg_id`，后续轮次收集结果 |
+| 判断标准 | — | bash 的 `run_in_background` 参数 |
 
 ---
 
 ## 工作原理
 
-### 1. 基础 Agent Loop 不需要改变
+### should_run_background: 显式请求
 
-每轮调用模型前，Harness 组装当前工具池：
+模型通过 bash 工具的 `run_in_background` 参数请求后台执行。只有参数明确为 `true`，并且工具是 bash 时，才会进入后台执行路径。其他调用仍然同步执行。
 
 ```python
-def agent_loop(messages: list):
-    while True:
-        tools, handlers = assemble_tool_pool()
-        response = client.messages.create(
-            model=MODEL,
-            system=assemble_system_prompt(),
-            messages=messages,
-            tools=tools,
-            max_tokens=8000,
-        )
+def should_run_background(tool_name: str, tool_input: dict) -> bool:
+    return (
+        tool_name == "bash"
+        and tool_input.get("run_in_background") is True
+    )
+```
+
+不再根据 `install`、`build` 或 `test` 等关键词猜测。是否进入后台由工具调用明确决定。
+
+### BackgroundManager: 后台执行与生命周期
+
+`BackgroundManager` 保存任务状态和完成队列。`start()` 先登记任务，再启动 daemon 线程，并立即返回 `bg_id`：
+
+```python
+class BackgroundManager:
+    def __init__(self):
+        self.tasks = {}
+        self.results = {}
+        self._ready = []
+        self._lock = threading.Lock()
+
+    def start(self, block) -> str:
+        # Register task, then run _run() in a daemon thread.
         ...
+
+    def _run(self, task_id: str, command: str):
+        output, exit_code = _run_bash_process(command)
+        status = "completed" if exit_code == 0 else "failed"
+        with self._lock:
+            self.tasks[task_id]["status"] = status
+            self.results[task_id] = _format_bash_result(output, exit_code)
+            self._ready.append(task_id)
 ```
 
-连接新 server 后，下一轮 `assemble_tool_pool()` 会把新工具加入模型输入。工具执行后，结果仍作为 `tool_result` 追加到 messages。
+命令以非零状态退出或 worker 抛出异常时，任务会进入 `failed`。Shell 会在独立的进程组中启动；命令完成、超时，或 Agent 经正常路径、`SIGTERM` 退出时，运行时会停止原进程组。这只是生命周期清理，并不是沙箱；另建 session 的进程仍可能离开该进程组。
 
-### 2. MCPClient 保存发现结果和调用入口
+### collect_background_results: 通知收集
+
+后续轮次开始时，`collect()` 从完成队列中取出结果，并格式化为 `<task_notification>` 通知：
 
 ```python
-class MCPClient:
-    def register(self, tool_defs, handlers):
-        self.tools = list(tool_defs)
-        self._handlers = dict(handlers)
-
-    def call_tool(self, tool_name, args):
-        handler = self._handlers.get(tool_name)
-        if not handler:
-            return f"MCP error: unknown tool '{tool_name}'"
-        try:
-            return str(handler(**args))
-        except Exception as error:
-            return f"MCP error: {type(error).__name__}: {error}"
+def collect_background_results() -> list[str]:
+    return BACKGROUND.collect()
 ```
 
-`register()` 对应课程里的工具发现结果，`call_tool()` 对应调用入口。错误会返回给模型，不会直接结束 Agent Loop。
+通知不复用原始 `tool_use_id`。原始 tool call 已经用占位 `tool_result` 回复了；后续收集完成结果时，会用 `task_notification` 格式把它作为独立事件加入对话。一个 `tool_use` 仍然只对应一个 `tool_result`。
 
-### 3. connect_mcp 只负责连接和发现
+### 循环中的集成
+
+每次调用 LLM 前，Agent Loop 先收集已经完成的后台结果。`execute_tool()` 仍然在主线程执行 `PreToolUse`，然后再选择同步或后台执行：
 
 ```python
-def connect_mcp(name: str) -> str:
-    if name in mcp_clients:
-        return f"MCP server '{name}' already connected"
-    factory = MOCK_SERVERS.get(name)
-    if not factory:
-        return f"Unknown server '{name}'"
-    server = factory()
-    mcp_clients[name] = server
-    ...
+while True:
+    inject_background_results(messages)
+    response = client.messages.create(...)
+
+def execute_tool(block) -> str:
+    blocked = trigger_hooks("PreToolUse", block)
+    if blocked is not None:
+        return str(blocked)
+    if should_run_background(block.name, block.input):
+        task_id = start_background_task(block)
+        output = f"[Background task {task_id} started]"
+    else:
+        output = call_tool(block)
+    trigger_hooks("PostToolUse", block, output)
+    return output
 ```
 
-开始时，模型只看到五个基础工具和 `connect_mcp`。调用 `connect_mcp(name="docs")` 后，Harness 保存 docs client。下一轮模型调用会看到：
+慢操作先返回一个带 `bg_id` 的占位 tool_result。后台结果不会主动唤醒 Agent；下一次进入 Agent Loop 时，`inject_background_results()` 才会收集已经完成的结果。
 
-```text
-mcp__docs__search
-mcp__docs__get_version
+### 合起来跑
+
+```
+Turn 1:
+  LLM → bash "npm install" (run_in_background=true)
+  → start_background_task → bg_0001
+  → tool_result: "[Background task bg_0001 started]..."
+  → LLM: "OK, I'll check later. Let me also read the config."
+
+Turn 2:
+  LLM → read_file "package.json" (fast, sync)
+  → tool_result: file content
+
+Turn 3:
+  → collect bg_0001 as <task_notification>
+  → LLM sees: config file + install notification in one message
 ```
 
-### 4. 前缀区分不同 server 的同名工具
-
-多个 server 都可能提供 `search` 或 `status`。Harness 使用：
-
-```text
-mcp__{server}__{tool}
-```
-
-`normalize_mcp_name()` 把不适合模型工具名的字符替换为下划线。组装工具池时还会检查规范化后的名称冲突和 64 字符长度限制：
-
-```python
-prefixed = f"mcp__{safe_server}__{safe_tool}"
-if prefixed in origins:
-    raise ValueError("MCP tool name collision after normalization")
-```
-
-因此 `docs.one/get.version` 和 `docs_one/get_version` 不会悄悄映射到同一个名字。
-
-### 5. 工具定义和 handler 一起加入工具池
-
-```python
-tools.append({
-    "name": prefixed,
-    "description": tool_def.get("description", ""),
-    "input_schema": schema,
-})
-handlers[prefixed] = (
-    lambda *, client=server, tool=raw_name, **kwargs:
-    client.call_tool(tool, kwargs)
-)
-```
-
-模型看到带前缀的名字；handler 仍使用 server 原始工具名调用 `MCPClient`。默认参数保存当前 client 和 tool，避免循环里的 lambda 全部指向最后一个工具。
-
-### 6. 权限由宿主配置决定
-
-MCP server 可以提供 `readOnlyHint` 或 `destructiveHint`，但这些信息来自 server，不能直接作为授权依据。本章使用宿主侧策略：
-
-```python
-MCP_HOST_POLICY = {
-    ("docs", "search"): "allow",
-    ("docs", "get_version"): "allow",
-    ("deploy", "status"): "allow",
-    ("deploy", "trigger"): "confirm",
-}
-```
-
-`permission_hook()` 根据规范化后的工具名查询这份策略。未配置的外部工具默认需要用户确认；即使 description 写着 `readOnly`，也不会自动放行。
-
-### 7. 工具输入错误留在工具边界内
-
-模型可能漏传参数，也可能传入 server 不接受的字段。`execute_tool()` 和 `MCPClient.call_tool()` 都会捕获异常，并返回错误 `tool_result`：
-
-```text
-MCP error: TypeError: <lambda>() missing 1 required argument: 'query'
-```
-
-模型可以在下一轮修正参数，而不是让课程脚本直接退出。
+npm install 在后台运行时，Agent Loop 继续执行了 read_file。
 
 ---
 
-## 相对 s04 的变化
+## 本章新增了什么
 
-| 组件 | s04 | s14 |
-|---|---|---|
-| 基础工具 | 五个固定工具 | 保持不变 |
-| 工具来源 | `code.py` 中的定义 | 基础工具加动态发现的 MCP 工具 |
-| 工具池 | 固定 `TOOLS` | 每轮由 `assemble_tool_pool()` 组装 |
-| 外部工具名 | 无 | `mcp__{server}__{tool}` |
-| 权限 | Shell 和路径检查 | 增加宿主侧 MCP 策略 |
-| MCP transport | 无 | 使用进程内模拟 server 展示协议边界 |
-
-本章不带入 Task、Background、Cron、Team 或 Worktree。它们会在 s15 的 Integrated Harness 中与 MCP 合并。
+| 组件 | S04 Kernel | S11 |
+|------|-----------|-----------|
+| 执行模型 | 全部同步 | 慢操作后台线程 + 通知注入 |
+| bash schema | `command` | `command` + `run_in_background` |
+| 新函数 | — | `should_run_background`, `start_background_task`, `collect_background_results`, `inject_background_results` |
+| 新类型 | — | `BackgroundManager` |
+| 通知格式 | — | `<task_notification>`（不复用 tool_use_id） |
+| 循环行为 | 工具同步执行 | 显式后台执行，后续轮次收集完成结果 |
+| 工具 | 5 | 5（bash schema 增加一个参数） |
 
 ---
 
@@ -173,35 +155,24 @@ MCP error: TypeError: <lambda>() missing 1 required argument: 'query'
 
 ```sh
 cd learn-claude-code
-python s14_mcp_plugin/code.py
+python s11_background_tasks/code.py
 ```
 
-输入：
+试试这些 prompt：
 
-```text
-连接 docs server，搜索 agent hooks，并告诉我当前文档 API 版本。
-```
+1. `Run pip list in the background and find all Python files in this directory`
+2. `Run npm install (use run_in_background) and while waiting, read package.json`
+3. `Run a short sleep in the background, then list all Markdown files`
 
-一次典型工具轨迹是：
-
-```text
-connect_mcp(name="docs")
-mcp__docs__search(query="agent hooks")
-mcp__docs__get_version()
-```
-
-再输入：
-
-```text
-连接 deploy server，查看 web 服务状态，不要触发部署。
-```
-
-`status` 会按宿主策略直接执行；`trigger` 需要用户确认。
+观察重点：显式设置 `run_in_background` 后，命令有没有被送到后台？`bg_id` 是否返回？后续轮次有没有以 `<task_notification>` 格式收集完成结果？
 
 ---
 
 ## 接下来
 
-目前，MCP 还是一条独立的课程分支。s15 Integrated Harness 会把基础工具、Hooks、Skills、Context、Memory、Task、Background、Cron、Teams 和 MCP 放进同一个运行时。
+后台任务解决了"慢操作不阻塞"。但如果想定时做某件事呢？比如"每天早上 9 点跑测试"、"每 5 分钟检查一次服务器状态"。
 
-<!-- translation-sync: zh@v9, en@v9, ja@v9 -->
+s12 Cron Scheduler → 给 Agent 装一个闹钟。
+
+
+<!-- translation-sync: zh@v7, en@v7, ja@v7 -->
