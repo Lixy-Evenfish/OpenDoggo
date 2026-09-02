@@ -26,8 +26,14 @@ import io.opendoggo.permission.ApprovalPrompt;
 /** Minimal full-screen terminal UI and the sole owner of terminal input. */
 public final class TerminalTui implements ApprovalPrompt {
 
-    private static final TextColor ACCENT = TextColor.ANSI.MAGENTA;
+    private static final TextColor EDGE_COLOR = TextColor.ANSI.BLACK;
     private static final TextColor USER_COLOR = TextColor.ANSI.YELLOW;
+    private static final TextColor TITLE_COLOR =
+            new TextColor.RGB(90, 90, 90);
+
+    /** Chat labels: purple a shade deeper than ANSI magenta. */
+    private static final TextColor LABEL_COLOR =
+            new TextColor.RGB(150, 40, 170);
     private static final TextColor INPUT_BACKGROUND =
             new TextColor.RGB(238, 238, 238);
     private static final TextColor INPUT_FOREGROUND =
@@ -37,6 +43,15 @@ public final class TerminalTui implements ApprovalPrompt {
     private static final int INPUT_HEIGHT = 3;
     private static final int FOOTER_HEIGHT = 1;
     private static final int FRAME_DELAY_MILLIS = 30;
+    private static final long TIMER_FRAME_NANOS = 100_000_000L;
+
+    /** Slash commands offered by the palette; dispatch lives in Main. */
+    private static final List<Command> COMMANDS = List.of(
+            new Command(
+                    "/init",
+                    "scan the workspace and write AGENTS.md"
+            )
+    );
 
     private final String workingDirectory;
     private final Object stateLock = new Object();
@@ -56,6 +71,10 @@ public final class TerminalTui implements ApprovalPrompt {
     private boolean busy;
     private int cursor;
     private int scrollFromBottom;
+    private volatile long turnStartedNanos;
+    private volatile long segmentStartedNanos;
+    private long lastFrameNanos;
+    private String turnCommand;
 
     @FunctionalInterface
     public interface TurnHandler {
@@ -91,9 +110,10 @@ public final class TerminalTui implements ApprovalPrompt {
                     handleKey(key, handler);
                 }
 
-                if (dirty) {
+                if (dirty || timerFrameDue()) {
                     dirty = false;
                     render();
+                    lastFrameNanos = System.nanoTime();
                 }
 
                 try {
@@ -141,10 +161,24 @@ public final class TerminalTui implements ApprovalPrompt {
         return request.allowed;
     }
 
-    /** Adds a completed tool call to the visible conversation. */
+    /**
+     * Adds a completed tool call to the visible conversation.
+     * The label carries the cumulative turn elapsed; the
+     * input timer restarts because a new wait begins.
+     */
     public void showToolResult(String toolName, String output) {
+        long startedAt = turnStartedNanos;
+        long now = System.nanoTime();
+
+        String label =
+                "Doggo Tool: " + sanitize(String.valueOf(toolName));
+        if (startedAt != 0L) {
+            label += "  " + formatElapsed(now - startedAt);
+            segmentStartedNanos = now;
+        }
+
         pendingChat.add(new ChatEntry(
-                "Doggo Tool: " + sanitize(String.valueOf(toolName)),
+                label,
                 abbreviate(sanitize(String.valueOf(output)), 200)
         ));
         dirty = true;
@@ -260,10 +294,13 @@ public final class TerminalTui implements ApprovalPrompt {
         cursor = 0;
         conversation = true;
         busy = true;
+        turnCommand = commandToken(prompt);
         scrollFromBottom = 0;
         chat.add(new ChatEntry("YOU", prompt));
         dirty = true;
         long startedAt = System.nanoTime();
+        turnStartedNanos = startedAt;
+        segmentStartedNanos = startedAt;
 
         worker = new Thread(() -> {
             TurnResult result;
@@ -302,6 +339,9 @@ public final class TerminalTui implements ApprovalPrompt {
         completedTurn = null;
         busy = false;
         worker = null;
+        turnStartedNanos = 0L;
+        segmentStartedNanos = 0L;
+        turnCommand = null;
         scrollFromBottom = 0;
         chat.add(new ChatEntry(
                 result.error
@@ -341,6 +381,12 @@ public final class TerminalTui implements ApprovalPrompt {
         }
     }
 
+    /** Forces periodic redraws while a turn runs so the timer advances. */
+    private boolean timerFrameDue() {
+        return turnStartedNanos != 0L
+                && System.nanoTime() - lastFrameNanos >= TIMER_FRAME_NANOS;
+    }
+
     private void render() throws IOException {
         TerminalSize size = screen.getTerminalSize();
         screen.clear();
@@ -374,7 +420,7 @@ public final class TerminalTui implements ApprovalPrompt {
                 (size.getColumns() - columnWidth(title)) / 2);
         int centerY = size.getRows() / 2;
 
-        graphics.setForegroundColor(ACCENT);
+        graphics.setForegroundColor(TITLE_COLOR);
         graphics.putString(titleX, centerY - 3, title, SGR.BOLD);
 
         int width = Math.min(64, size.getColumns() - 4);
@@ -384,10 +430,12 @@ public final class TerminalTui implements ApprovalPrompt {
 
     private void renderConversation(TerminalSize size) {
         TextGraphics graphics = screen.newTextGraphics();
+        List<Command> matches = matchingCommands();
         int contentHeight = size.getRows()
                 - INPUT_HEIGHT
                 - FOOTER_HEIGHT
-                - 1;
+                - 1
+                - matches.size();
         List<DisplayLine> lines = buildDisplayLines(
                 Math.max(1, size.getColumns() - 4)
         );
@@ -406,7 +454,7 @@ public final class TerminalTui implements ApprovalPrompt {
                     line.label && "YOU".equals(line.text)
                             ? USER_COLOR
                             : line.label
-                            ? ACCENT
+                            ? LABEL_COLOR
                             : TextColor.ANSI.DEFAULT
             );
             if (line.label) {
@@ -423,6 +471,26 @@ public final class TerminalTui implements ApprovalPrompt {
                 size.getRows() - INPUT_HEIGHT - FOOTER_HEIGHT,
                 size.getColumns() - 2
         );
+
+        if (!matches.isEmpty()) {
+            int paletteRow = size.getRows()
+                    - INPUT_HEIGHT
+                    - FOOTER_HEIGHT
+                    - matches.size();
+            for (Command command : matches) {
+                graphics.setForegroundColor(LABEL_COLOR);
+                graphics.putString(2, paletteRow, command.name(), SGR.BOLD);
+                graphics.setForegroundColor(FOOTER_COLOR);
+                graphics.putString(
+                        2 + command.name().length() + 2,
+                        paletteRow,
+                        clip(command.description(),
+                                size.getColumns() - 6)
+                );
+                paletteRow++;
+            }
+            graphics.setForegroundColor(TextColor.ANSI.DEFAULT);
+        }
 
         graphics.setForegroundColor(FOOTER_COLOR);
         graphics.putString(
@@ -446,7 +514,7 @@ public final class TerminalTui implements ApprovalPrompt {
                 new TerminalSize(width, INPUT_HEIGHT),
                 ' '
         );
-        graphics.setForegroundColor(ACCENT);
+        graphics.setForegroundColor(EDGE_COLOR);
         graphics.putString(left, top, "|");
         graphics.putString(left, top + 1, "|");
         graphics.putString(left, top + 2, "|");
@@ -455,7 +523,12 @@ public final class TerminalTui implements ApprovalPrompt {
         String shown;
         int cursorColumn;
         if (busy) {
-            shown = "Thinking...";
+            shown = (turnCommand == null
+                    ? "Thinking... "
+                    : "Running " + turnCommand + "... ")
+                    + formatElapsed(
+                            System.nanoTime() - segmentStartedNanos
+                    );
             cursorColumn = 0;
         } else {
             InputSlice slice = inputSlice(Math.max(1, width - 4));
@@ -501,7 +574,7 @@ public final class TerminalTui implements ApprovalPrompt {
                 ' '
         );
         drawBox(graphics, left, top, width, height);
-        graphics.setForegroundColor(ACCENT);
+        graphics.setForegroundColor(EDGE_COLOR);
         graphics.putString(
                 left + 2,
                 top + 1,
@@ -534,7 +607,7 @@ public final class TerminalTui implements ApprovalPrompt {
             int width,
             int height
     ) {
-        graphics.setForegroundColor(ACCENT);
+        graphics.setForegroundColor(EDGE_COLOR);
         graphics.putString(left, top, "+" + "-".repeat(width - 2) + "+");
         graphics.putString(
                 left,
@@ -545,6 +618,38 @@ public final class TerminalTui implements ApprovalPrompt {
             graphics.putString(left, row, "|");
             graphics.putString(left + width - 1, row, "|");
         }
+    }
+
+    /** Slash-command palette entries matching the idle input prefix. */
+    private List<Command> matchingCommands() {
+        if (!conversation || busy || input.length() == 0
+                || input.charAt(0) != '/') {
+            return List.of();
+        }
+
+        String typed = input.toString();
+        List<Command> matches = new ArrayList<>();
+        for (Command command : COMMANDS) {
+            if (command.name().startsWith(typed)) {
+                matches.add(command);
+            }
+        }
+        return matches;
+    }
+
+    /** The COMMANDS token when this submission is a known command. */
+    private static String commandToken(String prompt) {
+        if (!prompt.startsWith("/")) {
+            return null;
+        }
+
+        String name = prompt.split("\\s+", 2)[0];
+        for (Command command : COMMANDS) {
+            if (command.name().equals(name)) {
+                return name;
+            }
+        }
+        return null;
     }
 
     private List<DisplayLine> buildDisplayLines(int width) {
@@ -697,6 +802,9 @@ public final class TerminalTui implements ApprovalPrompt {
     }
 
     private record ChatEntry(String role, String text) {
+    }
+
+    private record Command(String name, String description) {
     }
 
     private record DisplayLine(String text, boolean label) {

@@ -4,10 +4,24 @@
 
 - Keep the TUI in `ui.TerminalTui` very small; `image/迎宾页面.png` and `image/对话页面.png` are visual references only.
 - The welcome screen needs only a title and one input box; the first submitted prompt opens the conversation screen.
-- The conversation screen needs only scrollable chat history and a fixed input box. Omit the reference UI's model/mode selectors, token and cost status, command palette, agent tabs, tips, and other metadata.
-- Keep the current workspace footer and per-turn elapsed time beside the `Doggo` label; do not grow them into a general status bar.
+- The conversation screen needs only scrollable chat history and a fixed input box. Omit the reference UI's model/mode selectors, token and cost status, agent tabs, tips, and other metadata. One deliberate exception: the `/` command palette, limited to real slash commands (`/init` only); do not grow it into a general menu.
+- Keep the current workspace footer and per-turn elapsed time beside the `Doggo` label; do not grow them into a general status bar. Timing has two clocks: the input box shows a segment timer `Thinking... <elapsed>` that restarts from zero on every tool result, while the cumulative turn time rides the `Doggo Tool: <name>  <total>` labels and freezes into the final `Doggo  <elapsed>` label — no new status elements.
 - Keep both the dependency choice and new code minimal. Do not remove the destructive-operation approval flow to simplify the UI.
 - `TerminalTui` is the sole terminal-input owner and also implements `ApprovalPrompt`; do not add another reader for `System.in`.
+- Planned follow-up work enriches the TUI content; route additions through the threading and channel rules in the map below instead of adding new terminal layers.
+
+## TUI Implementation Map
+
+All TUI behavior lives in `ui.TerminalTui` (Lanterna 3.1.2 `Screen`); read it before changing anything visual.
+
+- One UI thread runs a 30 ms loop in `run()`: resize check → drain `pendingChat` → consume `completedTurn` → `pollInput()` → `render()` when `dirty` or when `timerFrameDue()` fires. Rendering is a full `screen.clear()` redraw per frame; there are no partial updates.
+- Each Enter spawns a daemon `agent-turn` thread running the `TurnHandler` that `Main` wires to `runTurn` → `AgentLoop.run`. Enter stamps two clocks: `turnStartedNanos` (whole turn) and `segmentStartedNanos` (current wait). While `busy`, text editing is locked, the input shows `Thinking... <elapsed>` counting from `0.0s` — or `Running <command>... <elapsed>` on slash-command turns — and scrolling (PageUp/PageDown page, arrows line, tracked as `scrollFromBottom`) stays live. Each `showToolResult` stamps its label with the cumulative turn elapsed (`Doggo Tool: <name>  <total>`, agent thread, hence both stamps are volatile) and restarts `segmentStartedNanos`, so the input timer measures the wait since the last tool result; forced redraws every 100 ms come from `timerFrameDue()`, keyed on `turnStartedNanos`. `consumeCompletedTurn()` clears both stamps; the frozen total lands in the `Doggo  <elapsed>` label.
+- Agent→UI channels are exactly two: the PostToolUse hook calls `showToolResult` into the `ConcurrentLinkedQueue pendingChat`, and the final text lands in `volatile completedTurn`. The UI thread never calls the agent directly.
+- `ask()` (the `ApprovalPrompt` implementation) blocks the agent thread on a `CountDownLatch` while the UI draws a centered overlay: `y` allows, `n`/Enter denies. Escape/Ctrl+C/EOF quit from any state; shutdown denies pending approvals and interrupts the worker.
+- The chat model is `List<ChatEntry>` (role, text); `buildDisplayLines` flattens entries into label/body lines after `sanitize` (strips control chars) and `wrap` (codepoint-safe, `TerminalTextUtils.getColumnWidth`, so CJK width is handled). Colors: `YOU` yellow; other labels (`Doggo`, `Doggo Tool: <name>  <cumulative elapsed>`, `Error`) deep purple `LABEL_COLOR`; welcome title dark gray; input-box edge bars and approval-box border/title black `EDGE_COLOR`.
+- Layout constants: `INPUT_HEIGHT` 3, `FOOTER_HEIGHT` 1, minimum terminal 30×10 (below that only `Terminal too small` renders). The footer is the workspace path; the welcome screen is a centered title plus the same input box.
+- Slash commands: `TerminalTui.COMMANDS` drives the palette (shown above the input only when the idle conversation-screen input starts with `/`, filtered by prefix) and the trigger feedback — `commandToken()` marks a submitted turn as a known command, and the busy input shows `Running <command>... <elapsed>` instead of `Thinking...`. Dispatch happens in `Main.handleInput` before any model call — `/init` rewrites to `INIT_PROMPT` and runs a normal turn, unknown commands return an error string without a model call (the TUI deliberately does not mark unknown slash input as running). Adding a command means a `COMMANDS` entry plus a `handleInput` branch; `AgentLoop` never sees raw slash text.
+- Known deliberate gaps, likely targets for the planned enrichment: plain text only (no markdown), no streaming (answers appear at turn end), single-line input, tool previews capped at 200 chars, no way to cancel a running turn without quitting.
 
 ## Repository Shape
 

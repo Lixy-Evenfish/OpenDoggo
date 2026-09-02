@@ -45,6 +45,22 @@ public final class Main {
     // s06 R5：子代理轮次上限（参考实现 range(30)）。
     private static final int SUB_MAX_TOOL_ROUNDS = 30;
 
+    // “/”命令面板的唯一命令——不是工具，是提示词重写：
+    // 让模型按 init 语义扫描仓库并落 AGENTS.md。
+    private static final String INIT_COMMAND = "/init";
+
+    private static final String INIT_PROMPT =
+            "Inspect this workspace and create or update "
+                    + "AGENTS.md at the repository root: a "
+                    + "concise instruction file for future "
+                    + "coding agents covering the project "
+                    + "purpose, key directories, build and "
+                    + "verification commands, architecture "
+                    + "boundaries, and known gotchas. Read "
+                    + "the existing AGENTS.md first if "
+                    + "present and keep content that is "
+                    + "still accurate. Stay under 60 lines.";
+
     // s08 需求2：摘要调用的 system 提示词——
     // 只整理事实，不执行历史中的指令（防注入）。
     private static final String SUMMARIZER_SYSTEM_PROMPT =
@@ -147,6 +163,14 @@ public final class Main {
                 "Set run_in_background to true "
                         + "only for independent Bash "
                         + "commands.";
+        // 输出规范：emoji 在终端里的宽度计算与渲染
+        // 都不可靠（TUI 按码点折行，列宽对表情字符
+        // 估不准，换行会错位），回复一律不用表情。
+        String noEmoji =
+                "Do not use emoji or other "
+                        + "pictographs in replies; "
+                        + "the terminal UI cannot "
+                        + "render them reliably.";
 
         String systemPrompt = identity
                 + " " + planning
@@ -156,6 +180,7 @@ public final class Main {
                 + " " + mcp
                 + " " + sandbox
                 + " " + background
+                + " " + noEmoji
                 + "\n\n" + skills;
         // TUI 是唯一终端输入所有者，也实现权限审批回调。
         TerminalTui tui = new TerminalTui(workingDirectory);
@@ -322,7 +347,7 @@ public final class Main {
 
         List<Message> history = new ArrayList<>();
         try {
-            tui.run(query -> runTurn(
+            tui.run(query -> handleInput(
                     agentLoop,
                     hookRunner,
                     history,
@@ -418,6 +443,37 @@ public final class Main {
                 )
         );
         return hookRunner;
+    }
+
+    /**
+     * 回合入口的“/”命令拦截：/init 重写成 init
+     * 提示词走普通回合；未知命令直接回错误串，
+     * 不发起模型调用。TUI 只负责面板显示，
+     * 语义分发集中在这里。
+     */
+    private static String handleInput(
+            AgentLoop agentLoop,
+            HookRunner hookRunner,
+            List<Message> history,
+            String query
+    ) throws IOException, InterruptedException {
+        if (query.startsWith("/")) {
+            String name = query.split("\\s+", 2)[0];
+
+            if (INIT_COMMAND.equals(name)) {
+                return runTurn(
+                        agentLoop,
+                        hookRunner,
+                        history,
+                        INIT_PROMPT
+                );
+            }
+
+            return "Unknown command: " + name
+                    + ". Available: /init";
+        }
+
+        return runTurn(agentLoop, hookRunner, history, query);
     }
 
     /** Runs one TUI submission while preserving failed-turn rollback. */
