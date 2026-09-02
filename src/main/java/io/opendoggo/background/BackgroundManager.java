@@ -38,8 +38,6 @@ public final class BackgroundManager {
     /** bg_0001 风格的任务编号。 */
     private static final String ID_FORMAT = "bg_%04d";
 
-    private static final int COMMAND_PREVIEW_LENGTH = 60;
-
     private static final int SUMMARY_PREVIEW_LENGTH = 500;
 
     /** 一条后台任务的登记项（完成时以新实例整体替换）。 */
@@ -150,13 +148,6 @@ public final class BackgroundManager {
             throw exception;
         }
 
-        System.out.println(
-                "  [background] started "
-                        + taskId + ": "
-                        + preview(command,
-                        COMMAND_PREVIEW_LENGTH)
-        );
-
         return taskId;
     }
 
@@ -248,11 +239,6 @@ public final class BackgroundManager {
                             + "</task_notification>"
             );
 
-            System.out.println(
-                    "  [background] collected "
-                            + taskId + ": "
-                            + task.status()
-            );
         }
 
         return notifications;

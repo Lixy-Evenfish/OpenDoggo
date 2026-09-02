@@ -864,12 +864,18 @@ public final class CompactionDemo {
 
         List<String> preToolUseSeen =
                 new ArrayList<>();
+        List<String> postToolUseSeen =
+                new ArrayList<>();
 
         HookRunner hooks = new HookRunner();
         hooks.registerPreToolUse(toolCall -> {
             preToolUseSeen.add(toolCall.name());
             return null;
         });
+        hooks.registerPostToolUse(
+                (toolCall, output) ->
+                        postToolUseSeen.add(toolCall.name())
+        );
 
         ToolDispatch dispatch = new ToolDispatch();
         dispatch.register(echoHandler());
@@ -894,7 +900,12 @@ public final class CompactionDemo {
         check(
                 preToolUseSeen.contains("echo")
                         && !preToolUseSeen.contains("compact"),
-                "echo 走 hooks，compact 被拦在 hooks 之前"
+                "compact 绕过 PreToolUse，echo 照常经过"
+        );
+
+        check(
+                postToolUseSeen.equals(List.of("echo", "compact")),
+                "echo 与 compact 都产生 PostToolUse 结果通知"
         );
 
         check(

@@ -9,7 +9,6 @@ import io.opendoggo.mcp.McpRegistry;
 import io.opendoggo.model.Message;
 import io.opendoggo.model.ModelClient;
 import io.opendoggo.model.impl.AnthropicClient;
-import io.opendoggo.permission.ConsoleApprovalPrompt;
 import io.opendoggo.permission.PermissionChecker;
 import io.opendoggo.sandbox.SandboxRunner;
 import io.opendoggo.skill.SkillLoader;
@@ -26,30 +25,22 @@ import io.opendoggo.tool.impl.ShellTool;
 import io.opendoggo.tool.impl.TaskTool;
 import io.opendoggo.tool.impl.TodoWrite;
 import io.opendoggo.tool.impl.WriteFileTool;
+import io.opendoggo.ui.TerminalTui;
 
-import java.io.BufferedReader;
 import java.io.IOException;
-import java.io.InputStreamReader;
-import java.nio.charset.StandardCharsets;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Locale;
-import java.util.Set;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 
 /**
  * OpenDoggo 入口，对应 s1 的 __main__ 段。
  *
- * 读取配置 -> 装配 AgentLoop -> 进入 REPL。
+ * 读取配置 -> 装配 AgentLoop -> 进入 TUI。
  */
 public final class Main {
-
-    private static final Set<String> EXIT_COMMANDS =
-            Set.of("q", "exit", "");
 
     // s06 R5：子代理轮次上限（参考实现 range(30)）。
     private static final int SUB_MAX_TOOL_ROUNDS = 30;
@@ -166,34 +157,28 @@ public final class Main {
                 + " " + sandbox
                 + " " + background
                 + "\n\n" + skills;
-        // s06：reader 与权限先于工具装配——
-        // 父/子两个 hookRunner 都依赖 permissionChecker。
-        BufferedReader reader = new BufferedReader(
-                new InputStreamReader(
-                        System.in,
-                        StandardCharsets.UTF_8
-                )
-        );
+        // TUI 是唯一终端输入所有者，也实现权限审批回调。
+        TerminalTui tui = new TerminalTui(workingDirectory);
 
         // s14：MCP 注册表——先于权限装配，
         // 它是 mcp__ 工具宿主侧授权策略的数据源；
         // 分发表与 client 的 tools 刷新在父循环装配完成后 attach。
         McpRegistry mcpRegistry = new McpRegistry();
 
-        // 闸门 3 的控制台实现：默认拒绝；
+        // 闸门 3 的 TUI 实现：默认拒绝；
         // mcp__ 前缀工具的策略查询交给注册表。
         PermissionChecker permissionChecker =
-                new PermissionChecker(
-                        workingDirectory,
-                        new ConsoleApprovalPrompt(reader),
+                 new PermissionChecker(
+                         workingDirectory,
+                        tui,
                         mcpRegistry::isAllowed
                 );
 
-        HookRunner hookRunner = initHooks(
+        HookRunner hookRunner = initHooks(permissionChecker, tui);
+        HookRunner subHookRunner = initSubHooks(
                 permissionChecker,
-                workingDirectory
+                tui
         );
-        HookRunner subHookRunner = initSubHooks(permissionChecker);
 
         // s08 需求2：摘要专用 client——system 固化为
         // "只整理事实"的摘要提示词，无 tools（summarize
@@ -335,7 +320,17 @@ public final class Main {
                 backgroundManager
         );
 
-        runRepl(agentLoop, hookRunner, workingDirectory, reader);
+        List<Message> history = new ArrayList<>();
+        try {
+            tui.run(query -> runTurn(
+                    agentLoop,
+                    hookRunner,
+                    history,
+                    query
+            ));
+        } catch (IOException | RuntimeException exception) {
+            System.err.println("TUI error: " + exception.getMessage());
+        }
     }
 
     /**
@@ -389,312 +384,72 @@ public final class Main {
     }
 
 
-    /**
-     * s06 R9：子代理的 hook 装配。
-     *
-     * 权限与父循环共用同一个 PermissionChecker 实例
-     * （委派不降级权限，Gate 3 审批照常弹出）；
-     * 展示换成精简的 [sub] 前缀：输出预览 100 字符 +
-     * 子会话统计，不重复父循环的横幅/日志/全量输出。
-     */
+    /** Subagents share the same permission policy as the parent. */
     private static HookRunner initSubHooks(
-            PermissionChecker permissionChecker
+            PermissionChecker permissionChecker,
+            TerminalTui tui
     ) {
         HookRunner hookRunner = new HookRunner();
-
-        // PreToolUse：三道闸门——与父循环同一实例。
         hookRunner.registerPreToolUse(
                 permissionChecker::check
         );
-
-        // PostToolUse：[sub] 预览——
-        // 工具名 + 输出前 100 字符，灰色缩进两格。
-        hookRunner.registerPostToolUse((toolCall, output) -> {
-            String preview = String.valueOf(output);
-
-            if (preview.length() > 100) {
-                preview = preview.substring(0, 100);
-            }
-
-            System.out.println(
-                    "  \u001B[90m[sub] "
-                            + toolCall.name()
-                            + ": " + preview
-                            + "\u001B[0m"
-            );
-        });
-
-        // Stop：子会话统计——参考实现同样会在子消息
-        // 列表上触发 Stop summary。
-        hookRunner.registerStop(messages -> {
-            long toolCount = 0;
-
-            for (Message message : messages) {
-                JsonNode content = message.content();
-
-                if (content != null && content.isArray()) {
-                    for (JsonNode block : content) {
-                        if ("tool_result".equals(
-                                block.path("type").asText()
-                        )) {
-                            toolCount++;
-                        }
-                    }
-                }
-            }
-
-            System.out.println(
-                    "  \u001B[90m[sub] Stop: used "
-                            + toolCount
-                            + " tool calls\u001B[0m"
-            );
-            return null;
-        });
-
-        return hookRunner;
-    }
-
-    /**
-     * s04 的 hook 装配：创建注册表并按 agent 周期
-     * （输入 → 执行前 → 执行后 → 退出）注册全部 hook。
-     * 同一事件内注册顺序即执行顺序：
-     * 权限排在横幅与日志之前——被拒绝的调用什么都不打。
-     */
-    private static HookRunner initHooks(
-            PermissionChecker permissionChecker,
-            Path workingDirectory
-    ) {
-        HookRunner hookRunner = new HookRunner();
-
-        // UserPromptSubmit：输入上下文提示（context_inject_hook）。
-        hookRunner.registerUserPromptSubmit(
-                query -> System.out.println(
-                        "[HOOK-UserPromptSubmit] UserPromptSubmit: working in "
-                                + workingDirectory
+        hookRunner.registerPostToolUse(
+                (toolCall, output) -> tui.showToolResult(
+                        toolCall.name(),
+                        output
                 )
         );
-
-        // PreToolUse 1/3：三道闸门（s03 权限逻辑整体搬上 hook）。
-        hookRunner.registerPreToolUse(
-                permissionChecker::check
-        );
-
-        // PreToolUse 2/3：工具横幅（原 AgentLoop 里的 "> name"）。
-        // 注册在权限之后——被拒绝的调用不打横幅。
-        hookRunner.registerPreToolUse(toolCall -> {
-            System.out.println("[HOOK-PreToolUse]> " + toolCall.name());
-            return null;
-        });
-
-        // PreToolUse 3/3：调用日志（log_hook）——
-        // 取前两个参数值、截断 60 字符；仅旁观。
-        hookRunner.registerPreToolUse(toolCall -> {
-            List<String> values = new ArrayList<>();
-            JsonNode input = toolCall.input();
-
-            if (input != null) {
-                input.forEach(
-                        node -> values.add(node.asText())
-                );
-            }
-
-            String argsPreview =
-                    values.stream().limit(2).toList().toString();
-
-            if (argsPreview.length() > 60) {
-                argsPreview =
-                        argsPreview.substring(0, 60);
-            }
-
-            System.out.println(
-                    "[HOOK] " + toolCall.name()
-                            + "(" + argsPreview + ")"
-            );
-            return null;
-        });
-
-        // PostToolUse 1/4：控制台全量打印工具输出（调试用），
-        // 完整输出同时回传给模型。
-        hookRunner.registerPostToolUse((toolCall, output) -> {
-            // s05：todo_write 有专门的展示块，不重复打印。
-            if ("todo_write".equals(toolCall.name())) {
-                return;
-            }
-
-            System.out.println("[HOOK-PostToolUse]本地工具调用返回结果（to LLM）————————");
-            System.out.println(output);
-            System.out.println("END———————————————————————————————————");
-        });
-
-        // PostToolUse 2/4：大输出警告（large_output_hook）。
-        // ShellTool 输出上限 5 万字符，实际由 read_file 等触发。
-        hookRunner.registerPostToolUse((toolCall, output) -> {
-            if (output != null && output.length() > 100_000) {
-                System.out.println(
-                        "[HOOK] Large output from "
-                                + toolCall.name()
-                                + ": " + output.length()
-                                + " chars"
-                );
-            }
-        });
-
-        // PostToolUse 3/4（s05）：todo_write 的控制台展示——
-        // 参考实现在工具里 print 黄色 "## Current Tasks"，
-        // 按 UI-free 原则搬到 hook 层。
-        hookRunner.registerPostToolUse((toolCall, output) -> {
-            if (!"todo_write".equals(toolCall.name())) {
-                return;
-            }
-
-            // 参考实现校验失败时直接返回，不打展示块。
-            if (output == null || output.startsWith("Error:")) {
-                return;
-            }
-
-            System.out.println();
-            System.out.println("\u001B[33m## Current Tasks\u001B[0m");
-            System.out.println(output);
-        });
-
-        // PostToolUse 4/4（s06）：task 结束标记——
-        // 输出等于哨兵字符串即超限停止，否则正常结束。
-        hookRunner.registerPostToolUse((toolCall, output) -> {
-            if (!"task".equals(toolCall.name())) {
-                return;
-            }
-
-            String marker =
-                    TaskTool.STOPPED_MESSAGE.equals(output)
-                            ? "[Subagent stopped]"
-                            : "[Subagent done]";
-
-            System.out.println(
-                    "\u001B[35m" + marker + "\u001B[0m"
-            );
-        });
-
-        // PreToolUse 4/4（s06）：task 起跑标记——
-        // 注册在权限/横幅/日志之后，被拒绝的 task 不打。
-        hookRunner.registerPreToolUse(toolCall -> {
-            if ("task".equals(toolCall.name())) {
-                System.out.println(
-                        "\u001B[35m[Subagent started]\u001B[0m"
-                );
-            }
-            return null;
-        });
-
-        // Stop：会话统计（summary_hook）——
-        // 数历史里的 tool_result 块；返回 null 允许退出。
-        hookRunner.registerStop(messages -> {
-            long toolCount = 0;
-
-            for (Message message : messages) {
-                JsonNode content = message.content();
-
-                if (content != null && content.isArray()) {
-                    for (JsonNode block : content) {
-                        if ("tool_result".equals(
-                                block.path("type").asText()
-                        )) {
-                            toolCount++;
-                        }
-                    }
-                }
-            }
-
-            System.out.println(
-                    "[HOOK] Stop: session used "
-                            + toolCount + " tool calls"
-            );
-            return null;
-        });
-
         return hookRunner;
     }
 
-    /**
-     * 读一行、跑一轮、打印最终回复。
-     */
-    private static void runRepl(
+    /** Keep permission first and send completed tools to the chat view. */
+    private static HookRunner initHooks(
+            PermissionChecker permissionChecker,
+            TerminalTui tui
+    ) {
+        HookRunner hookRunner = new HookRunner();
+        hookRunner.registerPreToolUse(
+                permissionChecker::check
+        );
+        hookRunner.registerPostToolUse(
+                (toolCall, output) -> tui.showToolResult(
+                        toolCall.name(),
+                        output
+                )
+        );
+        return hookRunner;
+    }
+
+    /** Runs one TUI submission while preserving failed-turn rollback. */
+    private static String runTurn(
             AgentLoop agentLoop,
             HookRunner hookRunner,
-            Path workingDirectory,
-            BufferedReader reader
-    ) {
-        System.out.println("OpenDoggo v2: Agent Loop & Hook");
-        System.out.println("cwd: " + workingDirectory);
-        System.out.println(
-                "Enter a question, press Enter to send. "
-                        + "Type q to quit."
-        );
-        System.out.println();
+            List<Message> history,
+            String query
+    ) throws IOException, InterruptedException {
+        hookRunner.triggerUserPromptSubmit(query);
+        List<Message> checkpoint = copyHistory(history);
+        history.add(Message.user(query));
 
-        List<Message> history = new ArrayList<>();
-
-        while (true) {
-            System.out.print("doggo >> ");
-            System.out.flush();
-
-            String query;
-
-            try {
-                query = reader.readLine();
-            } catch (IOException exception) {
-                break;
-            }
-
-            // Ctrl+D 或流结束。
-            if (query == null) {
-                break;
-            }
-
-            String normalized =
-                    query.strip().toLowerCase(Locale.ROOT);
-
-            if (EXIT_COMMANDS.contains(normalized)) {
-                break;
-            }
-
-            // s04：query 进入历史、见到 LLM 之前，
-            // 通知 UserPromptSubmit hook。
-            hookRunner.triggerUserPromptSubmit(query);
-
-            // 失败时回滚到本轮之前，避免历史损坏。
-            int checkpoint = history.size();
-
-            history.add(Message.user(query));
-
-            try {
-                System.out.println(
-                        agentLoop.run(history, query)
-                );
-
-            } catch (InterruptedException exception) {
-                Thread.currentThread().interrupt();
-                truncate(history, checkpoint);
-                System.err.println("Interrupted.");
-                break;
-
-            } catch (IOException | RuntimeException exception) {
-                truncate(history, checkpoint);
-                System.err.println(
-                        "Error: " + exception.getMessage()
-                );
-            }
-
-            System.out.println();
+        try {
+            return agentLoop.run(history, query);
+        } catch (IOException | InterruptedException
+                 | RuntimeException exception) {
+            history.clear();
+            history.addAll(checkpoint);
+            throw exception;
         }
     }
 
-    private static void truncate(
-            List<Message> history,
-            int size
-    ) {
-        while (history.size() > size) {
-            history.remove(history.size() - 1);
+    private static List<Message> copyHistory(List<Message> history) {
+        List<Message> copy = new ArrayList<>(history.size());
+        for (Message message : history) {
+            copy.add(new Message(
+                    message.role(),
+                    message.content().deepCopy()
+            ));
         }
+        return copy;
     }
 
     private static boolean isBlank(String value) {

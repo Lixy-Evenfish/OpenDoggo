@@ -134,10 +134,6 @@ public final class PermissionChecker {
 
             for (String pattern : DENY_LIST) {
                 if (command.contains(pattern)) {
-                    System.out.println(
-                            "[blocked] '" + pattern
-                                    + "' is on the deny list"
-                    );
                     return "Permission denied by deny list";
                 }
             }

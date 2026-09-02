@@ -12,7 +12,7 @@ v1 版本的目标是初步实现 agent loop 的核心闭环，完成基本的�
 
 功能范围：
 
-- **Agent Loop主循环** — 核心循环支持 Anthropic Messages 格式的 AI 调用（仅 JDK `HttpClient`，无 SDK 依赖）：模型请求工具就继续循环，不请求就返回最终回答，上限 50 轮；单次回复中的多个 tool_use 依次执行后一并回传。外层是命令行 REPL，多轮对话，历史驻留内存
+- **Agent Loop主循环** — 核心循环支持 Anthropic Messages 格式的 AI 调用（仅 JDK `HttpClient`，无 SDK 依赖）：模型请求工具就继续循环，不请求就返回最终回答，上限 50 轮；单次回复中的多个 tool_use 依次执行后一并回传。外层是全屏 TUI，多轮对话，历史驻留内存
 - **工具注册与调度** — 工具实现统一的 `ToolHandler` 接口、注册进 `ToolDispatch` 按名分发；发给模型的 `tools` 数组由注册表自动生成，新增工具不需要改客户端代码
 - **五种具体工具** — `bash` / `read_file` / `write_file` / `edit_file` / `glob`，覆盖命令执行、读、写、精确编辑与文件查找（详见下文[工具](#工具)一节）
 - **权限控制与错误回退** — 最基础的工具权限控制：执行前依次过硬拒绝表、规则匹配、用户审批三道闸门（详见下文[权限](#权限)一节）；单轮失败时回滚历史，避免残留消息污染后续请求
@@ -44,9 +44,9 @@ v3 版本的目标是给 agent 增加 ContextCompact 上下文压缩、MCP tools
 - **长任务放后台** — 后台线程执行命令，后续轮次收集完成结果。
 - **代码沙箱** — 新增 `run_code` 工具，把代码放进一次性容器执行，以机制隔离宿主风险：无网络、根文件系统只读、仅挂载本次运行的临时目录、非特权用户、资源限额与双层超时；容器不继承宿主环境变量，密钥进不了沙箱。权限管线靠用户审批（策略），沙箱靠机制保证出不去——隔离代替审批，因此免审批。需本机 Docker，支持 Python、Node.js、Bash。
 
-## v4（未完成）
+## v4
 
-v4 版本的目标是依靠 AI 大人的帮助给 agent 设计 TUI 界面，并支持 "/" 命令系统。
+v4 提供极简全屏 TUI：迎宾页只有标题和输入框，首次提交后进入带滚动聊天记录和固定输入框的对话页。对话页底部显示当前工作目录，`Doggo` 标签后显示该轮总耗时。界面不显示模型、模式、token、费用等附加信息；危险操作仍通过审批浮层确认。
 
 
 ## 环境要求
@@ -87,11 +87,13 @@ mvn package
 java -jar target/opendoggo-0.1.0-SNAPSHOT.jar
 ```
 
+`Enter` 发送，`↑`/`↓` 或 `PageUp`/`PageDown` 滚动聊天记录，`Esc` 或 `Ctrl+C` 退出。审批浮层中按 `Y` 允许，按 `N` 或 `Enter` 拒绝。
+
 ## 工具
 
 工具实现 `ToolHandler` 接口（`name` / `description` / `inputSchema` / `execute`），在 `Main` 中注册进 `ToolDispatch`。发给模型的 `tools` 数组由注册表自动生成，新增工具不需要改客户端代码。
 
-每次工具执行前，控制台先打印 `> 工具名` 横幅（方便确认是哪个工具在跑），再显示最多 200 字符的结果预览；完整结果仍照常回传给模型。
+工具调用及完整结果仍回传给模型；TUI 会在聊天记录中显示每个工具名和最多 200 个字符的结果预览，包括被拒绝的调用和循环内处理的 `compact`。
 
 ### bash
 
@@ -171,7 +173,7 @@ description: 什么时候用这个技能——目录里唯一的触发依据，�
 
 仓库自带四个课程示例技能：`agent-builder`、`code-review`、`mcp-builder`、`pdf`。`agent-builder` 的 `references/`、`scripts/` 附属文件不参与扫描，但模型加载技能后可用 `read_file` 按 SKILL.md 正文里给出的相对路径读取。
 
-### 在 REPL 里怎么用
+### 在 TUI 里怎么用
 
 不需要任何新命令，正常说话即可（工具不直接暴露给用户，模型自行决定何时加载）：
 
@@ -199,17 +201,17 @@ s03 权限管线（`io.opendoggo.permission.PermissionChecker`）插在 `AgentLo
 |------|------|----------|
 | 1. 硬拒绝表 | 7 条子串（`rm -rf /`、`sudo`、`shutdown`、`reboot`、`mkfs`、`dd if=`、`> /dev/sda`），仅对 bash | 直接拒绝，不询问 |
 | 2. 规则匹配 | 文件工具路径逸出工作区；bash 命中破坏性正则（`rm`/`del` 为独立命令词，`model`、`echo del x` 不误伤）或关键字 `rm `、`> /etc/`、`chmod 777`；bash 引用工作区外路径（`..` 段、`~`、工作区外绝对路径，教学级 token 启发式） | 升级到闸门 3 |
-| 3. 用户审批 | 打印原因与工具调用，提示 `Allow? [y/N]` | 默认拒绝，仅 y/yes 放行 |
+| 3. 用户审批 | TUI 浮层显示原因与工具调用 | 默认拒绝，仅 `Y` 放行 |
 
 - 未登记规则的工具（如 `glob`）三道闸门都不会命中，直接放行
 - bash 跨区检测按空白切分命令逐 token 判断：引号内含空格的路径、等号粘连的选项（如 `--prefix=/x`）识别不了
 - 被拒调用仍回传带原 `tool_use_id` 的 `tool_result`，内容为 `Permission denied.`，消息协议不变
-- 审批交互经 `ApprovalPrompt` 回调注入，权限层与 `AgentLoop` 不直接碰控制台
+- 审批交互经 `ApprovalPrompt` 回调注入，由 `TerminalTui` 统一读取按键；权限层与 `AgentLoop` 不直接读取终端
 - 同 s02：子串与正则匹配属教学级防护，不是安全边界
 
 ### 用法示例
 
-工具不直接暴露给用户，模型按需自行选择。REPL 里用自然语言描述即可：
+工具不直接暴露给用户，模型按需自行选择。TUI 里用自然语言描述即可：
 
 ```
 doggo >> 把 README.md 的前 5 行读给我
@@ -234,12 +236,12 @@ agent/AgentLoop.java
 
 ```
 io.opendoggo
-├── Main                    入口：读配置、装配、REPL、控制台审批
+├── Main                    入口：读配置并装配 TUI 与 AgentLoop
 ├── agent.AgentLoop         核心循环：调模型、权限检查、分发工具、回灌结果
 ├── environment.Env         配置加载：.env 优先，回落进程环境变量
 ├── permission
 │   ├── PermissionChecker   三道闸门：硬拒绝表、规则匹配、用户审批
-│   └── ApprovalPrompt      闸门 3 审批回调（Main 提供控制台实现）
+│   └── ApprovalPrompt      闸门 3 审批回调（TerminalTui 实现）
 ├── sandbox.SandboxRunner   代码沙箱：一次性容器、资源限额、双层超时
 ├── tool
 │   ├── ToolHandler         工具接口：name / description / schema / execute

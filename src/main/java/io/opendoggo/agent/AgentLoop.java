@@ -234,6 +234,8 @@ public final class AgentLoop {
              round < maxToolRounds;
              round++) {
 
+            throwIfInterrupted();
+
             // s08：每次调用模型前先跑压缩管线
             // （确定性整理 + 仍超限时的历史摘要）。
             if (compactor != null) {
@@ -316,14 +318,41 @@ public final class AgentLoop {
             boolean usedTodo = false;
             boolean compactRequested = false;
             // 一次模型回复可能包含多个工具调用。
-            for (ContentBlock toolCall : toolCalls) {
-                // s08 R3：compact 在 hooks 之前拦截——
-                // 不经过权限检查与 dispatch（参考实现
-                // 不让 execute_tool 见到它），直接回
-                // 字面确认串；真正的压缩等整批结果
-                // 入史后再执行。
+            for (int toolIndex = 0;
+                 toolIndex < toolCalls.size();
+                 toolIndex++) {
+                ContentBlock toolCall = toolCalls.get(toolIndex);
+
+                if (Thread.currentThread().isInterrupted()) {
+                    for (int remaining = toolIndex;
+                         remaining < toolCalls.size();
+                         remaining++) {
+                        ContentBlock interruptedCall =
+                                toolCalls.get(remaining);
+                        hookRunner.triggerPostToolUse(
+                                interruptedCall,
+                                "Error: Agent turn interrupted"
+                        );
+                        results.add(new ToolResult(
+                                interruptedCall.id(),
+                                "Error: Agent turn interrupted"
+                        ));
+                    }
+                    messages.add(Message.toolResults(results));
+                    throw new InterruptedException(
+                            "Agent turn interrupted"
+                    );
+                }
+
+                // s08 R3：compact 不经过 PreToolUse 与 dispatch，
+                // 但仍以 PostToolUse 通知 UI；真正的压缩等整批
+                // 结果入史后再执行。
                 if (COMPACT_TOOL_NAME.equals(
                         toolCall.name())) {
+                    hookRunner.triggerPostToolUse(
+                            toolCall,
+                            COMPACT_RESULT
+                    );
                     results.add(new ToolResult(
                             toolCall.id(),
                             COMPACT_RESULT
@@ -339,6 +368,10 @@ public final class AgentLoop {
                         hookRunner.triggerPreToolUse(toolCall);
 
                 if (blocked != null) {
+                    hookRunner.triggerPostToolUse(
+                            toolCall,
+                            blocked
+                    );
                     results.add(
                             new ToolResult(
                                     toolCall.id(),
@@ -440,6 +473,13 @@ public final class AgentLoop {
                         + maxToolRounds
                         + " tool rounds"
         );
+    }
+
+    private static void throwIfInterrupted()
+            throws InterruptedException {
+        if (Thread.currentThread().isInterrupted()) {
+            throw new InterruptedException("Agent turn interrupted");
+        }
     }
 
     /**

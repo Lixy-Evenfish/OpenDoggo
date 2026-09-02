@@ -396,6 +396,10 @@ public final class BackgroundDemo {
                 name -> true
         );
         fixture.hooks.registerPreToolUse(checker::check);
+        List<String> postOutputs = new ArrayList<>();
+        fixture.hooks.registerPostToolUse(
+                (toolCall, output) -> postOutputs.add(output)
+        );
 
         fixture.responses.add(response(
                 toolUseBlock("p1",
@@ -416,6 +420,10 @@ public final class BackgroundDemo {
 
         check(fixture.manager.statusOf("bg_0001") == null,
                 "被拒绝的调用没有进入后台");
+
+        check(postOutputs.equals(List.of(
+                        "Permission denied by deny list")),
+                "被拒绝的调用仍产生 PostToolUse 结果通知");
     }
 
     /** JVM 退出清理：destroyAllRunning 终止在跑后台命令。 */

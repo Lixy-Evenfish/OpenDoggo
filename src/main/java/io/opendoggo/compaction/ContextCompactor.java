@@ -161,7 +161,6 @@ public final class ContextCompactor {
             }
 
             if (estimateChars(messages) > CONTEXT_CHAR_LIMIT) {
-                System.out.println("[auto compact]");
                 compactHistory(messages, activeRequest);
             }
         }
@@ -436,9 +435,6 @@ public final class ContextCompactor {
             String activeRequest
     ) {
         Path transcript = writeTranscript(messages);
-        System.out.println(
-                "[transcript saved: " + transcript + "]"
-        );
 
         String summary = summarizeHistory(messages);
         Message message = summaryMessage(
@@ -463,12 +459,7 @@ public final class ContextCompactor {
             List<Message> messages,
             String activeRequest
     ) {
-        System.out.println("[reactive compact]");
-
         Path transcript = writeTranscript(messages);
-        System.out.println(
-                "[transcript saved: " + transcript + "]"
-        );
 
         int tailStart = Math.max(
                 0,
