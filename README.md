@@ -4,7 +4,7 @@
 
 **仓库地址**：https://github.com/Lixy-Evenfish/OpenDoggo.git
 
-**跑在终端里的开源 AI coding agent**——用自然语言提需求，它自己调模型、读写文件、执行命令，循环迭代直到任务完成。模型客户端零 AI SDK 依赖（仅 JDK `HttpClient` 实现），从 agent loop 起步逐步搭成，适合用来拆解一个 coding agent 的内部机制。
+**一个开源 AI coding agent**，以提供工具的方法，协助支持 Anthropic Message 格式的 LLM 读写本地文件、执行命令、获取上下文，直到任务完成。本 Agent 实现了对话历史与上下文管理、工具的定义与本地执行等常见功能并拓展了进阶功能。模型客户端零 AI SDK 依赖（仅 JDK `HttpClient` 实现），适合用来拆解一个 coding agent 的内部机制。
 
 ![运行效果图](image/image1.png "TUI页面")
 
