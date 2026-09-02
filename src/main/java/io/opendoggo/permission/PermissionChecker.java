@@ -76,21 +76,21 @@ public final class PermissionChecker {
                     input -> escapesWorkspace(
                             text(input, "path")
                     ),
-                    "Access outside workspace"
+                    "访问工作区外的路径"
             ),
             new Rule(
                     Set.of(BASH),
                     input -> isDestructive(
                             text(input, "command")
                     ),
-                    "Potentially destructive command"
+                    "潜在破坏性命令"
             ),
             new Rule(
                     Set.of(BASH),
                     input -> referencesOutsideWorkspace(
                             text(input, "command")
                     ),
-                    "Access outside workspace"
+                    "访问工作区外的路径"
             )
     );
 
@@ -162,7 +162,7 @@ public final class PermissionChecker {
             return approvalPrompt.ask(
                     toolCall.name(),
                     input,
-                    "External MCP tool"
+                    "外部 MCP 工具"
             )
                     ? null
                     : "Permission denied by user";

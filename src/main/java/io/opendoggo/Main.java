@@ -182,8 +182,10 @@ public final class Main {
                 + " " + background
                 + " " + noEmoji
                 + "\n\n" + skills;
-        // TUI 是唯一终端输入所有者，也实现权限审批回调。
-        TerminalTui tui = new TerminalTui(workingDirectory);
+        // TUI 是唯一终端输入所有者，也实现权限审批回调；
+        // 页脚要显示模型名，构造时一并传入。
+        TerminalTui tui =
+                new TerminalTui(workingDirectory, modelId);
 
         // s14：MCP 注册表——先于权限装配，
         // 它是 mcp__ 工具宿主侧授权策略的数据源；

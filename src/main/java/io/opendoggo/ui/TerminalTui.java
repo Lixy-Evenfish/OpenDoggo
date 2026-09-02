@@ -54,6 +54,7 @@ public final class TerminalTui implements ApprovalPrompt {
     );
 
     private final String workingDirectory;
+    private final String modelId;
     private final Object stateLock = new Object();
     private final List<ChatEntry> chat = new ArrayList<>();
     private final ConcurrentLinkedQueue<ChatEntry> pendingChat =
@@ -73,6 +74,7 @@ public final class TerminalTui implements ApprovalPrompt {
     private int scrollFromBottom;
     private volatile long turnStartedNanos;
     private volatile long segmentStartedNanos;
+    private volatile long approvalElapsedNanos;
     private long lastFrameNanos;
     private String turnCommand;
 
@@ -81,11 +83,15 @@ public final class TerminalTui implements ApprovalPrompt {
         String submit(String prompt) throws Exception;
     }
 
-    public TerminalTui(Path workingDirectory) {
+    public TerminalTui(Path workingDirectory, String modelId) {
         this.workingDirectory = Objects.requireNonNull(
                 workingDirectory,
                 "workingDirectory cannot be null"
         ).toAbsolutePath().normalize().toString();
+        this.modelId = Objects.requireNonNull(
+                modelId,
+                "modelId cannot be null"
+        );
     }
 
     /** Runs until Escape, Ctrl+C, or terminal EOF. */
@@ -142,6 +148,14 @@ public final class TerminalTui implements ApprovalPrompt {
                 abbreviate(String.valueOf(toolInput), 300),
                 reason
         );
+
+        // 弹出审批的瞬间冻结思考计时——等待用户决策
+        // 的时间不算思考；先写冻结值再挂 request，
+        // UI 见到 approval 时读到的必是新值。
+        long segmentStart = segmentStartedNanos;
+        approvalElapsedNanos = segmentStart == 0L
+                ? 0L
+                : System.nanoTime() - segmentStart;
 
         synchronized (stateLock) {
             if (!running) {
@@ -376,6 +390,9 @@ public final class TerminalTui implements ApprovalPrompt {
             }
             request.allowed = allowed;
             approval = null;
+            // 审批等待已冻结在 approvalElapsedNanos；
+            // 回答后分段计时从 0 重起，等工具结果落地。
+            segmentStartedNanos = System.nanoTime();
             request.answer.countDown();
             dirty = true;
         }
@@ -426,6 +443,21 @@ public final class TerminalTui implements ApprovalPrompt {
         int width = Math.min(64, size.getColumns() - 4);
         int left = (size.getColumns() - width) / 2;
         renderInput(graphics, left, centerY, width);
+
+        // 迎宾页脚注：路径紧贴输入框左缘，模型名另起一行。
+        graphics.setForegroundColor(FOOTER_COLOR);
+        int footerWidth = size.getColumns() - left - 2;
+        graphics.putString(
+                left,
+                centerY + INPUT_HEIGHT,
+                clip(workingDirectory, footerWidth)
+        );
+        graphics.putString(
+                left,
+                centerY + INPUT_HEIGHT + 1,
+                clip("当前模型：" + modelId, footerWidth)
+        );
+        graphics.setForegroundColor(TextColor.ANSI.DEFAULT);
     }
 
     private void renderConversation(TerminalSize size) {
@@ -492,13 +524,7 @@ public final class TerminalTui implements ApprovalPrompt {
             graphics.setForegroundColor(TextColor.ANSI.DEFAULT);
         }
 
-        graphics.setForegroundColor(FOOTER_COLOR);
-        graphics.putString(
-                2,
-                size.getRows() - 1,
-                clip(workingDirectory, size.getColumns() - 4)
-        );
-        graphics.setForegroundColor(TextColor.ANSI.DEFAULT);
+        renderFooter(graphics, size, size.getRows() - 1);
     }
 
     private void renderInput(
@@ -523,12 +549,13 @@ public final class TerminalTui implements ApprovalPrompt {
         String shown;
         int cursorColumn;
         if (busy) {
+            long elapsed = approval == null
+                    ? System.nanoTime() - segmentStartedNanos
+                    : approvalElapsedNanos;
             shown = (turnCommand == null
                     ? "Thinking... "
                     : "Running " + turnCommand + "... ")
-                    + formatElapsed(
-                            System.nanoTime() - segmentStartedNanos
-                    );
+                    + formatElapsed(elapsed);
             cursorColumn = 0;
         } else {
             InputSlice slice = inputSlice(Math.max(1, width - 4));
@@ -549,6 +576,31 @@ public final class TerminalTui implements ApprovalPrompt {
 
         graphics.setForegroundColor(TextColor.ANSI.DEFAULT);
         graphics.setBackgroundColor(TextColor.ANSI.DEFAULT);
+    }
+
+    /** Shared footer: workspace path left, model name right. */
+    private void renderFooter(
+            TextGraphics graphics,
+            TerminalSize size,
+            int row
+    ) {
+        graphics.setForegroundColor(FOOTER_COLOR);
+        int pathLimit = size.getColumns() - 4;
+
+        String model = "当前模型：" + modelId;
+        int modelX = size.getColumns() - 2
+                - columnWidth(model);
+        if (modelX >= 8) {
+            graphics.putString(modelX, row, model);
+            pathLimit = modelX - 4;
+        }
+
+        graphics.putString(
+                2,
+                row,
+                clip(workingDirectory, pathLimit)
+        );
+        graphics.setForegroundColor(TextColor.ANSI.DEFAULT);
     }
 
     private void renderApproval(
@@ -574,11 +626,11 @@ public final class TerminalTui implements ApprovalPrompt {
                 ' '
         );
         drawBox(graphics, left, top, width, height);
-        graphics.setForegroundColor(EDGE_COLOR);
+        graphics.setForegroundColor(USER_COLOR);
         graphics.putString(
                 left + 2,
                 top + 1,
-                clip("Permission required", width - 4),
+                clip("需要权限确认", width - 4),
                 SGR.BOLD
         );
         graphics.setForegroundColor(TextColor.ANSI.DEFAULT);
@@ -593,11 +645,13 @@ public final class TerminalTui implements ApprovalPrompt {
             graphics.putString(left + 2, row++, line);
         }
 
+        graphics.setForegroundColor(USER_COLOR);
         graphics.putString(
                 left + 2,
                 top + height - 2,
-                clip("[Y] Allow    [N/Enter] Deny", width - 4)
+                clip("[Y] 允许    [N/回车] 拒绝", width - 4)
         );
+        graphics.setForegroundColor(TextColor.ANSI.DEFAULT);
     }
 
     private static void drawBox(
